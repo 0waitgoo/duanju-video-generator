@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>短剧视频生成</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🎬 短剧视频生成 <span class="sub">读画布导出包 · MiniMax H3 出片</span></div>
+  <div class="top-actions">
+    <span id="keyStatus" class="key-status">未填 Key</span>
+    <button id="settingsBtn" class="btn">⚙️ 设置</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <section id="importBox" class="card dropzone">
+    <div class="dz-title">📦 导入画布导出包</div>
+    <p class="muted">把画布顶栏「导出项目」下载的 <code>&lt;画布名&gt;-项目导出.zip</code> 拖到这里，或点下面选择文件。</p>
+    <p class="muted small">包里是 project.json（格式 duanju-canvas-export v1）＋ images/ 图片。重复导入同一画布会整包替换。</p>
+    <div class="row">
+      <input type="file" id="fileInput" accept=".zip" hidden>
+      <button id="pickFileBtn" class="btn primary">选择 ZIP 包导入</button>
+      <span id="importMsg" class="muted"></span>
+    </div>
+  </section>
+
+  <section id="projectBox" class="hidden">
+    <div class="project-head">
+      <h2 id="projectTitle">—</h2>
+      <div id="projectMeta" class="muted"></div>
+    </div>
+    <div id="segments"></div>
+  </section>
+
+  <section id="emptyBox" class="card muted center">
+    还没有导入项目。先导入画布导出 ZIP 包，再按段生成视频。
+  </section>
+
+  <section id="jobsBox" class="card hidden">
+    <h3>📋 生成任务</h3>
+    <div id="jobs"></div>
+  </section>
+</main>
+
+<div id="settingsModal" class="modal hidden">
+  <div class="modal-card">
+    <h3>⚙️ 设置</h3>
+    <label>DeepSeek Key <span class="muted small">（文字处理：优化提示词）</span></label>
+    <input type="password" id="deepseekKey" placeholder="sk-..." autocomplete="off">
+    <div class="hint">已保存：<span id="deepseekMasked">未填写</span> · 申请：platform.deepseek.com → API Keys</div>
+
+    <label>MiniMax Key <span class="muted small">（视频生成：MiniMax H3，按量付费）</span></label>
+    <input type="password" id="minimaxKey" placeholder="..." autocomplete="off">
+    <div class="hint">已保存：<span id="minimaxMasked">未填写</span> · 申请：platform.minimax.io → Account Management → API Keys（须开通按量付费）</div>
+
+    <label>MiniMax 接口地址</label>
+    <select id="minimaxBaseUrl">
+      <option value="https://api.minimax.io">https://api.minimax.io（国际站）</option>
+      <option value="https://api.minimax.chat">https://api.minimax.chat</option>
+      <option value="https://api.minimax.cn">https://api.minimax.cn（中国大陆站）</option>
+    </select>
+
+    <div class="grid2">
+      <div>
+        <label>模型</label>
+        <select id="model">
+          <option value="MiniMax-H3">MiniMax-H3（高质量）</option>
+          <option value="MiniMax-H3-Highspeed">MiniMax-H3-Highspeed（均衡）</option>
+          <option value="MiniMax-H3-Lite">MiniMax-H3-Lite（轻量）</option>
+          <option value="MiniMax-H3-Max">MiniMax-H3-Max（快速）</option>
+        </select>
+      </div>
+      <div>
+        <label>分辨率</label>
+        <select id="resolution">
+          <option value="768P">768P</option>
+          <option value="2K">2K</option>
+          <option value="480P">480P</option>
+        </select>
+      </div>
+      <div>
+        <label>画幅</label>
+        <select id="ratio">
+          <option value="adaptive">自适应（按参考图）</option>
+          <option value="9:16">9:16（竖屏）</option>
+          <option value="16:9">16:9</option>
+          <option value="1:1">1:1</option>
+          <option value="3:4">3:4</option>
+          <option value="4:3">4:3</option>
+          <option value="21:9">21:9</option>
+        </select>
+      </div>
+      <div>
+        <label>声音</label>
+        <select id="generateAudio">
+          <option value="true">带声音</option>
+          <option value="false">静音</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <button id="testConnBtn" class="btn">测试连接</button>
+      <span id="testConnMsg" class="muted"></span>
+    </div>
+    <div class="row end">
+      <button id="settingsCancelBtn" class="btn">取消</button>
+      <button id="settingsSaveBtn" class="btn primary">保存设置</button>
+    </div>
+    <p class="muted small">Key 只存在本机 data/settings.json，界面只显示末 4 位，不会上传到任何地方。</p>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>
