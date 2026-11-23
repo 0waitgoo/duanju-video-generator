@@ -20,9 +20,22 @@ function safeImage(name) {
       && !/[\\:<>"|?*\u0000-\u001f]|[. ]$/.test(part));
 }
 function normalize(raw) {
-  if (raw?.format !== 'duanju-canvas-export') throw Error('不是画布导出包，格式名应为 duanju-canvas-export。');
+  if (typeof raw?.format !== 'string' || raw.format.toLowerCase() !== 'duanju-canvas-export') throw Error('这不是画布导出包，格式名应为 duanju-canvas-export。');
   if (raw.version !== 1) throw Error('导出包版本不支持，目前支持 v1。');
-  if (!Array.isArray(raw.segments) || !raw.segments.length) throw Error('project.json 中没有可用的段。');
+  if (!Array.isArray(raw.segments) && Array.isArray(raw.scripts?.[0]?.segments)) {
+    const script = raw.scripts[0];
+    raw = { ...raw, canvasId: String(raw.project?.id ?? ''), canvasName: raw.project?.title,
+      scriptText: script.scriptText, globalSetup: script.globalSetup,
+      characters: list(raw.characters).map(item => ({ ...item, description: item.description ?? item.appearance, image: item.image ?? item.portraitFile })),
+      assets: list(raw.assets).map(item => ({ ...item, image: item.image ?? item.imageFile, kind: item.kind ?? item.categoryLabel })),
+      segments: script.segments.map(segment => ({ ...segment, index: segment.index ?? segment.segment,
+        gridImage: segment.gridImage ?? segment.imageFile,
+        shots: list(segment.shots).map(shot => ({ ...shot, shotIndex: shot.shotIndex ?? shot.shot,
+          camera: shot.camera ?? shot.cameraNote, charIds: shot.charIds ?? shot.characterIds,
+          dialogue: typeof shot.dialogue === 'string' ? (/^\s*[（(]?无台词[）)]?\s*$/.test(shot.dialogue) || !shot.dialogue ? null : { speaker: '', text: shot.dialogue }) : shot.dialogue })) })) };
+  }
+  if (!Array.isArray(raw.segments)) throw Error('project.json 的 segments 不是数组。');
+  if (!raw.segments.length) throw Error('这个画布还没有分镜，请先在画布里点一键分析。');
   const library = (entries, kind) => list(entries).filter(item => text(item?.name)).map(item => ({
     id: String(item.id ?? item.name), name: item.name, description: text(item.description),
     image: text(item.image), kind: kind || text(item.kind) || '道具', style: text(item.style),
@@ -36,7 +49,7 @@ function normalize(raw) {
       endCard: text(segment.endCard), gridImage: text(segment.gridImage),
       shots: segment.shots.map((shot, cell) => {
         if (!shot || Number(shot.shotIndex) !== ++last) throw Error('镜号不连续，应为第 ' + last + ' 镜。');
-        const durationSec = Number(shot.durationSec);
+        const durationSec = Number(shot.durationSec ?? shot.duration ?? shot.videoSec);
         return {
           shotIndex: last, cell, durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : 0,
           startSec: shot.startSec ?? null, endSec: shot.endSec ?? null,
@@ -158,42 +171,79 @@ function inspect(project) {
   return { issues, missing: [...missing] };
 }
 
+
 async function readProjectZip(file, dir) {
-  const stat = await fs.stat(file);
-  if (stat.size > 1536 * 1024 ** 2) throw Error('ZIP 超过 1.5 GB。请按集导出。');
-  const zip = await yauzl.openPromise(file, { validateEntrySizes: true, strictFileNames: true });
-  const images = Object.create(null);
-  const seen = new Set();
-  let raw;
-  let bytes = 0;
+  const diagnostic = { path: null, format: null, version: null, rawSegments: null, segments: [], filtered: [], missing: [] };
+  let zip;
   try {
-    for await (const entry of zip.eachEntry()) {
-      const name = entry.fileName;
-      if (name !== 'project.json' && !safeImage(name)) continue;
-      if (seen.has(name.toLowerCase())) throw Error('ZIP 中存在重复文件名：' + name);
+    const stat = await fs.stat(file);
+    if (stat.size > 1536 * 1024 ** 2) throw Error('ZIP 超过 1.5 GB。请按集导出。');
+    zip = await yauzl.openPromise(file, { validateEntrySizes: true, strictFileNames: true, autoClose: false });
+    const entries = [];
+    for await (const entry of zip.eachEntry()) entries.push(entry);
+    const manifests = entries.filter(entry => /(^|\/)project\.json$/i.test(entry.fileName) &&
+      entry.fileName.split('/').every(part => part && part !== '.' && part !== '..' && !part.includes('\\')));
+    manifests.sort((a, b) => (a.fileName.toLowerCase() === 'project.json' ? -1 : b.fileName.toLowerCase() === 'project.json' ? 1 : a.fileName.localeCompare(b.fileName)));
+    const manifest = manifests[0];
+    if (!manifest) throw Error('这不是画布导出包，ZIP 中没有 project.json。');
+    diagnostic.path = manifest.fileName;
+    diagnostic.candidates = manifests.map(entry => entry.fileName);
+    if (manifest.uncompressedSize > 8 * 1024 ** 2) throw Error('project.json 超过 8 MB。');
+    const chunks = [];
+    for await (const chunk of await zip.openReadStreamPromise(manifest)) chunks.push(chunk);
+    let raw;
+    try { raw = JSON.parse(Buffer.concat(chunks).toString('utf8').replace(/^\uFEFF/, '')); }
+    catch { throw Error('project.json 解析失败，请从画布重新导出。'); }
+    diagnostic.format = raw?.format ?? null;
+    diagnostic.version = raw?.version ?? null;
+    const inputSegments = Array.isArray(raw?.segments) ? raw.segments : raw?.scripts?.[0]?.segments;
+    diagnostic.segmentPath = Array.isArray(raw?.segments) ? 'segments' : 'scripts[0].segments';
+    diagnostic.rawSegments = Array.isArray(inputSegments) ? inputSegments.length : null;
+    if (Array.isArray(inputSegments)) {
+      diagnostic.segments = inputSegments.map((segment, index) => ({
+        index: segment?.index ?? segment?.segment ?? index + 1, shots: Array.isArray(segment?.shots) ? segment.shots.length : null,
+      }));
+      let last = 0;
+      inputSegments.forEach((segment, index) => {
+        if (!segment || Number(segment.index ?? segment.segment) !== index + 1 || !Array.isArray(segment.shots) || segment.shots.length < 1 || segment.shots.length > 4) {
+          diagnostic.filtered.push('第 ' + (index + 1) + ' 段的段号或镜数无效，整个导入被拒绝。');
+        }
+        if (Array.isArray(segment?.shots)) segment.shots.forEach(shot => {
+          last++;
+          if (!shot || Number(shot.shotIndex ?? shot.shot) !== last) diagnostic.filtered.push('第 ' + (index + 1) + ' 段第 ' + last + ' 镜的镜号无效，整个导入被拒绝。');
+        });
+      });
+    }
+    const project = normalize(raw);
+    const prefix = manifest.fileName.slice(0, manifest.fileName.lastIndexOf('/') + 1);
+    const images = Object.create(null);
+    const seen = new Set();
+    let bytes = 0;
+    for (const entry of entries) {
+      if (!entry.fileName.startsWith(prefix)) continue;
+      const name = entry.fileName.slice(prefix.length);
+      if (!safeImage(name)) continue;
+      if (seen.has(name.toLowerCase())) throw Error('ZIP 中存在重复图片：' + name);
       seen.add(name.toLowerCase());
-      const limit = name === 'project.json' ? 8 : 30;
       bytes += entry.uncompressedSize;
-      if (entry.uncompressedSize > limit * 1024 ** 2 || bytes > 1536 * 1024 ** 2) throw Error('包内文件超过大小限制：' + name);
+      if (entry.uncompressedSize > 30 * 1024 ** 2 || bytes > 1536 * 1024 ** 2) throw Error('包内图片超过大小限制：' + name);
       const dest = path.join(dir, name);
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await pipeline(await zip.openReadStreamPromise(entry), createWriteStream(dest, { flags: 'wx' }));
-      if (name === 'project.json') {
-        try { raw = JSON.parse((await fs.readFile(dest, 'utf8')).replace(/^\uFEFF/, '')); }
-        catch { throw Error('project.json 解析失败，请从画布重新导出。'); }
-      } else {
-        try {
-          const { width, height, type } = imageSize(await fs.readFile(dest));
-          images[name] = { width, height, valid: imageType(name) === 'image/' + (type === 'jpg' ? 'jpeg' : type) };
-        } catch { images[name] = { valid: false }; }
-      }
+      try {
+        const { width, height, type } = imageSize(await fs.readFile(dest));
+        images[name] = { width, height, valid: imageType(name) === 'image/' + (type === 'jpg' ? 'jpeg' : type) };
+      } catch { images[name] = { valid: false }; }
     }
-  } finally { if (zip.isOpen) zip.close(); }
-  if (!seen.has('project.json')) throw Error('包里没有 project.json，请选择画布「导出项目」ZIP。');
-  const project = normalize(raw);
-  project.images = images;
-  project.check = inspect(project);
-  return project;
+    project.images = images;
+    project.check = inspect(project);
+    diagnostic.missing = project.check.missing;
+    project.diagnostic = diagnostic;
+    return project;
+  } catch (error) {
+    error.diagnostic = diagnostic;
+    throw error;
+  } finally { if (zip?.isOpen) zip.close(); }
 }
 
 function readStoryboard(csv) {

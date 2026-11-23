@@ -57,7 +57,7 @@ function handle(name, callback) {
     try { return { ok: true, value: await callback(...args) }; }
     catch (error) {
       const code = error.code ?? error.status;
-      return { ok: false, error: code === 'ENOSPC' ? '磁盘空间不足，请释放空间。' :
+      return { ok: false, diagnostic: error.diagnostic, error: code === 'ENOSPC' ? '磁盘空间不足，请释放空间。' :
         (error.message || '处理失败。') + (code ? '（' + code + '）' : '') };
     }
   });

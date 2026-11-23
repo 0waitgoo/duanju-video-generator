@@ -23,7 +23,7 @@ let importPending = false;
 
 async function invoke(name, ...args) {
   const result = await window.studio.invoke(name, ...args);
-  if (!result.ok) throw Error(result.error);
+  if (!result.ok) { const error = Error(result.error); error.diagnostic = result.diagnostic; throw error; }
   return result.value;
 }
 function notify(message, error = false) {
@@ -276,8 +276,23 @@ async function importZip(file) {
     current = result.id;
     selection = 1;
     await refresh();
-    notify(result.replaced ? '已用本次 ZIP 替换同一画布项目。' : '画布项目已导入。');
+    showImportDiagnostic(project()?.diagnostic, '导入成功', result.replaced ? '已替换同一画布项目。' : '画布项目已导入。');
+  } catch (error) {
+    showImportDiagnostic(error.diagnostic, '导入失败', error.message);
   } finally { importPending = false; }
+}
+function showImportDiagnostic(diagnostic, title, message) {
+  const d = diagnostic || {};
+  const display = value => value === null || value === undefined ? '未获取' : JSON.stringify(value);
+  const segments = d.segments?.length ? d.segments.map(item => '第 ' + item.index + ' 段：' + (item.shots ?? '无 shots 数组') + ' 镜').join('；') : '无';
+  const filtered = d.filtered?.length ? d.filtered.join('；') : '无';
+  const missing = d.missing?.length ? d.missing.join('；') : '无';
+  modal(title + ' · 导入诊断', '<p>' + E(message) + '</p><div class="confirm-list">' +
+    '<div>project.json 路径：' + E(d.path || '未找到') + '</div>' +
+    '<div>format：' + E(display(d.format)) + '</div><div>version：' + E(display(d.version)) + '</div>' +
+    '<div>分段位置：' + E(d.segmentPath || '未获取') + '</div><div>segments 原始数量：' + E(display(d.rawSegments)) + '</div><div>每段镜数：' + E(segments) + '</div>' +
+    '<div>被过滤的段或镜：' + E(filtered) + '</div><div>缺失图片：' + E(missing) + '</div></div>',
+    button('关闭', 'close', 'class="primary"'));
 }
 async function act(action, data) {
   const p = project();
