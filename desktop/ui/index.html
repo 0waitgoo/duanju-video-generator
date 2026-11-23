@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' studio:; media-src studio:; base-uri 'none'; form-action 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>短剧成片工作室</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="logo" aria-hidden="true">◈</span><b>短剧成片工作室</b></div>
+    <div class="top-end"><span class="local"><i></i>本地工作区</span><button id="settings" class="quiet">设置</button></div>
+  </header>
+  <main class="layout">
+    <aside class="library">
+      <div class="library-head"><h2>项目库</h2><button id="import" class="import">＋ 导入 ZIP</button></div>
+      <div id="projects" class="projects"></div>
+      <div class="library-footer">画布导出包 · v1</div>
+    </aside>
+    <section id="workspace" class="workspace"></section>
+  </main>
+  <dialog id="modal"></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
+

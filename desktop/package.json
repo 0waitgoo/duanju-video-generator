@@ -1,0 +1,54 @@
+{
+  "name": "duanju-studio",
+  "version": "1.0.0",
+  "description": "短剧成片工作室",
+  "author": "Duanju Studio",
+  "private": true,
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "dist": "electron-builder --win nsis --x64 --publish never"
+  },
+  "build": {
+    "appId": "local.duanju.studio",
+    "productName": "短剧成片工作室",
+    "artifactName": "Duanju-Studio-Setup-${version}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**",
+      "ui/**",
+      "build/icon.ico",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/runtime",
+        "to": "runtime"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "signExecutable": false,
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "dependencies": {
+    "csv-parse": "^7.0.3",
+    "image-size": "^2.1.0",
+    "write-file-atomic": "^8.0.0",
+    "yauzl": "^3.4.0"
+  },
+  "devDependencies": {
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0"
+  }
+}
