@@ -19,6 +19,12 @@ function safeImage(name) {
     name.split('/').every(part => part && !/^(?:\.{1,2}|(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?)$/i.test(part)
       && !/[\\:<>"|?*\u0000-\u001f]|[. ]$/.test(part));
 }
+function gridPromptFor(raw, segment, index) {
+  const entry = list(raw.images).find(item => item &&
+    (Number(item.segment) === index || item.file === segment.gridImage) && (!item.kind || item.kind === 'grid'));
+  return text(entry?.prompt);
+}
+
 function normalize(raw) {
   if (typeof raw?.format !== 'string' || raw.format.toLowerCase() !== 'duanju-canvas-export') throw Error('这不是画布导出包，格式名应为 duanju-canvas-export。');
   if (raw.version !== 1) throw Error('导出包版本不支持，目前支持 v1。');
@@ -37,8 +43,8 @@ function normalize(raw) {
   if (!Array.isArray(raw.segments)) throw Error('project.json 的 segments 不是数组。');
   if (!raw.segments.length) throw Error('这个画布还没有分镜，请先在画布里点一键分析。');
   const library = (entries, kind) => list(entries).filter(item => text(item?.name)).map(item => ({
-    id: String(item.id ?? item.name), name: item.name, description: text(item.description),
-    image: text(item.image), kind: kind || text(item.kind) || '道具', style: text(item.style),
+    id: String(item.id ?? item.name), name: item.name, description: text(item.description ?? item.appearance),
+    image: text(item.image ?? item.imageFile), kind: kind || text(item.kind ?? item.category ?? item.categoryLabel) || '道具', style: text(item.style),
   }));
   let last = 0;
   const segments = raw.segments.map((segment, index) => {
@@ -46,7 +52,7 @@ function normalize(raw) {
         segment.shots.length < 1 || segment.shots.length > 4) throw Error('第 ' + (index + 1) + ' 段的段号或镜数无效。');
     return {
       index: index + 1, title: text(segment.title), setup: text(segment.setup), voices: text(segment.voices),
-      endCard: text(segment.endCard), gridImage: text(segment.gridImage),
+      endCard: text(segment.endCard), gridImage: text(segment.gridImage), gridPrompt: gridPromptFor(raw, segment, index + 1),
       shots: segment.shots.map((shot, cell) => {
         if (!shot || Number(shot.shotIndex) !== ++last) throw Error('镜号不连续，应为第 ' + last + ' 镜。');
         const durationSec = Number(shot.durationSec ?? shot.duration ?? shot.videoSec);
@@ -63,23 +69,52 @@ function normalize(raw) {
     };
   });
   const scriptText = text(raw.scriptText);
+  // 真实包没有顶层 scenes：场景以 category 'scene' 混在 assets 里，这里把它派生回场景库；
+  // 顶层 scenes 存在时也认，两者按 id 合并去重。道具库只留非场景项。
+  const assetsAll = library(raw.assets);
+  const scenes = [];
+  for (const item of [...library(raw.scenes, '场景'), ...assetsAll.filter(entry => entry.kind === '场景')]) {
+    if (!scenes.some(entry => entry.id === item.id)) scenes.push(item);
+  }
+  const assets = assetsAll.filter(item => item.kind !== '场景');
   return {
     format: raw.format, version: raw.version, id: randomUUID(), canvasId: text(raw.canvasId),
     canvasName: text(raw.canvasName) || '未命名画布',
     title: text(raw.scriptTitle) || scriptText.split(/\r?\n/).find(line => line.trim())?.replace(/^#+\s*/, '').slice(0, 120) || '未命名剧集',
     scriptText, globalSetup: text(raw.globalSetup), segments,
-    characters: library(raw.characters, '人物'), scenes: library(raw.scenes, '场景'), assets: library(raw.assets),
+    characters: library(raw.characters, '人物'), scenes, assets,
   };
 }
 
 function bindings(project, shots) {
   const words = shots.flatMap(shot => [shot.visual, shot.prompt, shot.dialogue?.speaker, shot.dialogue?.text]).join('\n');
-  const locked = new Set(shots.flatMap(shot => shot.assetIds));
-  return {
-    characters: project.characters.filter(item => words.includes(item.name)),
-    assets: [...project.scenes, ...project.assets].filter(item =>
-      words.includes(item.name) || (item.kind === '场景' && locked.has(item.id))),
-  };
+  const storedCharIds = [...new Set(shots.flatMap(shot => list(shot.charIds)).map(String))];
+  const storedAssetIds = [...new Set(shots.flatMap(shot => list(shot.assetIds)).map(String))];
+  const named = pool => pool.filter(item => words.includes(item.name));
+  const byId = (pool, ids) => pool.filter(item => ids.includes(String(item.id)));
+  // 人物：画布存量绑定是段级数据，视频按所覆盖的格子取交集（只留本组格子里点到名的人，
+  // 与画布“视频按格子重新推导人物”一致）；存量为空的老包退回名字匹配。
+  const storedChars = byId(project.characters, storedCharIds);
+  const namedChars = named(project.characters);
+  const characters = storedCharIds.length
+    ? storedChars.filter(item => namedChars.includes(item))
+    : namedChars;
+  // 场景/道具：存量 assetIds 为准（道具名很少写进画面文本，卡片、空气墙就靠它），
+  // 名字匹配只作补充。以前只靠名字匹配，段 1–4 的卡片、空气墙全丢了。
+  const assetPool = [...project.scenes, ...project.assets];
+  const assets = [...new Map([...byId(assetPool, storedAssetIds), ...named(assetPool)].map(item => [item.id, item])).values()];
+  return { characters, assets };
+}
+
+// MiniMax 每请求最多 9 张参考图：按四宫格图、人物、场景、道具排优先级取前 9 张，
+// 超出的只在一致性检查里报提醒，不拦生成。
+function referenceFiles(project, segment, part) {
+  const { characters, assets } = bindings(project, part.shots);
+  const scenes = assets.filter(item => item.kind === '场景');
+  const props = assets.filter(item => item.kind !== '场景');
+  const ordered = [...new Set([segment.gridImage, ...characters.map(item => item.image),
+    ...scenes.map(item => item.image), ...props.map(item => item.image)].filter(Boolean))];
+  return { files: ordered.slice(0, 9), dropped: ordered.slice(9) };
 }
 
 function plan(segment) {
@@ -154,15 +189,27 @@ function inspect(project) {
   for (const segment of project.segments) {
     check(segment.gridImage, '四宫格图', segment.index);
     for (const item of Object.values(bindings(project, segment.shots)).flat()) check(item.image, item.name + '参考图', segment.index);
-    try { plan(segment); } catch (error) { add('red', segment.index, null, error.message); }
+    try {
+      plan(segment);
+      for (const part of plan(segment)) {
+        const refs = referenceFiles(project, segment, part);
+        if (refs.dropped.length) add('yellow', segment.index, null, '子段 ' + part.id + ' 参考图超 9 张，已按四宫格图、人物、场景、道具取前 9 张；未提交参考图：' + refs.dropped.join('、'));
+      }
+    } catch (error) { add('red', segment.index, null, error.message); }
     for (const shot of segment.shots) {
       if (shot.hasDialogue && !shot.dialogue?.text?.trim()) add('red', segment.index, shot.shotIndex, '标注有台词，原文为空');
       if (!shot.durationSec) add('red', segment.index, shot.shotIndex, '镜头时长为 0');
       if (!shot.sfx) add('yellow', segment.index, shot.shotIndex, '未填写音效');
-      const actual = bindings(project, [shot]).characters.map(item => item.id);
-      if (shot.charIds.length && (shot.charIds.some(id => !actual.includes(id)) || actual.some(id => !shot.charIds.includes(id)))) {
-        add('yellow', segment.index, shot.shotIndex, '原始人物标记与镜内点名有差异，采用点名结果');
+      const known = new Set([...project.characters, ...project.scenes, ...project.assets].map(item => item.id));
+      for (const id of [...shot.charIds, ...shot.assetIds]) {
+        if (!known.has(String(id))) add('red', segment.index, shot.shotIndex, '绑定的资源不在库中：' + id);
       }
+      if (/##\s|^#+\s/m.test(shot.visual || '') || /##\s|^#+\s/m.test(shot.prompt || '')) {
+        add('red', segment.index, shot.shotIndex, '画面描述含场标题残留，请回画布重拆分镜后重新导出');
+      }
+    }
+    if (!bindings(project, segment.shots).characters.length && !segment.shots.some(shot => shot.dialogue?.text?.trim())) {
+      add('yellow', segment.index, null, '本段无人物绑定');
     }
   }
   for (const item of [...project.characters, ...project.assets, ...project.scenes]) {
@@ -215,6 +262,12 @@ async function readProjectZip(file, dir) {
       });
     }
     const project = normalize(raw);
+    diagnostic.library = { characters: project.characters.length, scenes: project.scenes.length, assets: project.assets.length };
+    diagnostic.bindings = project.segments.map(segment => {
+      const bound = bindings(project, segment.shots);
+      return { index: segment.index, characters: bound.characters.map(item => item.name), assets: bound.assets.map(item => item.name) };
+    });
+    diagnostic.gridPrompts = project.segments.filter(segment => segment.gridPrompt).length;
     const prefix = manifest.fileName.slice(0, manifest.fileName.lastIndexOf('/') + 1);
     const images = Object.create(null);
     const seen = new Set();
@@ -270,5 +323,5 @@ function readStoryboard(csv) {
   return scenes;
 }
 
-module.exports = { bindings, imageType, inspect, normalize, plan, prompt, readProjectZip, readStoryboard, seconds, safeImage };
+module.exports = { bindings, imageType, inspect, normalize, plan, prompt, readProjectZip, readStoryboard, referenceFiles, seconds, safeImage };
 

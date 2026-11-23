@@ -237,13 +237,11 @@ class Workspace {
     this.save();
   }
   refs(project, segment, part) {
-    const binding = projectData.bindings(project, part.shots);
-    const refs = [...new Set([segment.gridImage, ...Object.values(binding).flat().map(item => item.image)])];
-    if (refs.some(file => !projectData.safeImage(file) || !project.images[file]?.valid)) {
+    const { files } = projectData.referenceFiles(project, segment, part);
+    if (files.some(file => !projectData.safeImage(file) || !project.images[file]?.valid)) {
       throw Error('第 ' + segment.index + ' 段缺少可读参考图，请查看一致性检查。');
     }
-    if (refs.length > 9) throw Error('第 ' + segment.index + ' 段的子段参考图超过 9 张，请在画布减少绑定。');
-    return refs.map(file => path.join(this.projectsDir, project.id, file));
+    return files.map(file => path.join(this.projectsDir, project.id, file));
   }
   plans(project, n) {
     return (n ? [this.segment(project, n)] : project.segments).flatMap(segment =>

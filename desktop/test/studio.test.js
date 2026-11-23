@@ -204,3 +204,68 @@ test('重启遇到未确认的提交时停止自动重发', { skip: !fixtures },
   assert.equal(recovered.project(id).jobs[part.id].status, 'uncertain');
 });
 
+
+const realShapePath = path.join(__dirname, 'fixtures', 'real-shape-project.json');
+async function realShape() {
+  return projectIO.normalize(JSON.parse(await fs.readFile(realShapePath, 'utf8')));
+}
+function validImages(project) {
+  const images = {};
+  for (const file of [project.segments.map(s => s.gridImage), project.characters.map(c => c.image),
+    project.scenes.map(s => s.image), project.assets.map(a => a.image)].flat()) {
+    if (file) images[file] = { width: 100, height: 100, valid: true };
+  }
+  return { ...project, images };
+}
+
+test('真实包形状：存量绑定为准，场景从资产派生，四宫格提示词保留', async () => {
+  const project = await realShape();
+  assert.equal(project.segments.length, 2);
+  assert.equal(project.segments.reduce((sum, s) => sum + s.shots.length, 0), 8);
+  assert.deepEqual(project.scenes.map(item => item.name), ['涩谷十字路口', '便利店']);
+  assert.deepEqual(project.assets.map(item => item.name), ['卡片', '空气墙']);
+  assert.equal(project.characters.length, 2);
+  const seg1 = project.segments[0];
+  assert.equal(seg1.gridImage, 'images/segment-01-shots-1-4.webp');
+  assert.match(seg1.gridPrompt, /^四宫格分镜图/);
+  assert.equal(seg1.shots[0].dialogue, null);
+  assert.deepEqual(seg1.shots[3].dialogue, { speaker: '', text: '今天涩谷，人好多。' });
+  assert.ok(seg1.shots.every(shot => shot.visual && shot.prompt));
+  // 道具绑定：卡片、空气墙名字不在画面文本里，只能靠存量 assetIds 救回来。
+  const bound = projectIO.bindings(project, seg1.shots);
+  assert.deepEqual(bound.characters.map(item => item.name), ['阿杰', '小雅']);
+  assert.deepEqual(bound.assets.map(item => item.name), ['涩谷十字路口', '便利店', '卡片', '空气墙']);
+  const part = projectIO.plan(seg1)[0];
+  const first = projectIO.prompt(project, seg1, part);
+  assert.ok(first.includes('卡片'), first);
+  assert.ok(first.includes('空气墙'), first);
+  assert.match(first, /资产锁：[^\n]*卡片/);
+  assert.match(first, /资产锁：[^\n]*空气墙/);
+  const issues = projectIO.inspect(validImages(project)).issues;
+  assert.ok(!issues.some(item => item.message.includes('采用点名结果')), JSON.stringify(issues));
+  assert.ok(!issues.some(item => item.level === 'red'), JSON.stringify(issues));
+});
+
+test('坏数据报红：画面描述含场标题残留、无人物绑定的段', async () => {
+  const project = await realShape();
+  const bad = JSON.parse(JSON.stringify(project));
+  bad.segments[1].shots[0].visual = '中景，三分法构图，## 第二场 陨石降落';
+  for (const shot of bad.segments[1].shots) { shot.charIds = []; shot.dialogue = null; shot.visual = shot.visual.replace(/小雅/g, '女孩'); }
+  const issues = projectIO.inspect(validImages(bad)).issues;
+  assert.ok(issues.some(item => item.level === 'red' && item.segment === 2 && /场标题/.test(item.message)), JSON.stringify(issues));
+  assert.ok(issues.some(item => item.level === 'yellow' && item.segment === 2 && /无人物绑定/.test(item.message)), JSON.stringify(issues));
+});
+
+test('参考图超 9 张时按优先级取前 9 张并报出未提交的', () => {
+  const characters = Array.from({ length: 6 }, (_, i) => ({ id: String(i + 1), name: '人' + (i + 1), image: 'images/c' + (i + 1) + '.webp' }));
+  const scenes = [{ id: '11', name: '场景A', kind: '场景', image: 'images/s1.webp' }, { id: '12', name: '场景B', kind: '场景', image: 'images/s2.webp' }];
+  const assets = [{ id: '13', name: '道具A', kind: '道具', image: 'images/p1.webp' }, { id: '14', name: '道具B', kind: '道具', image: 'images/p2.webp' }];
+  const project = { characters, scenes, assets };
+  const segment = { gridImage: 'images/g.webp' };
+  const part = { shots: [{ charIds: ['1', '2', '3', '4', '5', '6'], assetIds: ['11', '12', '13', '14'],
+    visual: '人1、人2、人3、人4、人5、人6站在场景A和场景B之间，手里拿着道具A和道具B。', prompt: '', dialogue: null }] };
+  const refs = projectIO.referenceFiles(project, segment, part);
+  assert.equal(refs.files.length, 9);
+  assert.deepEqual(refs.dropped, ['images/p1.webp', 'images/p2.webp']);
+  assert.equal(refs.files[0], 'images/g.webp');
+});

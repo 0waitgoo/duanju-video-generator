@@ -76,10 +76,12 @@ function inspector(p, seg, shot) {
     E((shot.dialogue.speaker ? shot.dialogue.speaker + '：' : '') + shot.dialogue.text) + '</p>' : '<p class="muted">无台词</p>';
   return '<aside class="panel inspector"><header class="panel-head"><h2>第 ' + shot.shotIndex +
     ' 镜</h2><span class="mono muted">' + E(seconds(shot.durationSec)) + '</span></header><div class="inspect-body">' +
-    '<p><small>画面 · ' + E(shot.framing) + '</small>' + E(shot.visual || '—') + '</p>' + dialogue +
+    '<p><small>画面 · ' + E(shot.framing) + '</small>' + E(shot.visual || '—') + '</p>' +
+    '<p><small>分镜提示词</small>' + E(shot.prompt || '—') + '</p>' + dialogue +
     '<p><small>运镜</small>' + E(shot.camera || '—') + '</p><p><small>音效</small>' + E(shot.sfx || '—') + '</p>' +
     '<small>本段人物锁</small><div class="tags">' + (tags(p, seg.bindings.characters) || '—') + '</div>' +
-    '<small>本段场景与道具</small><div class="tags">' + (tags(p, seg.bindings.assets) || '—') + '</div></div></aside>';
+    '<small>本段场景与道具</small><div class="tags">' + (tags(p, seg.bindings.assets) || '—') + '</div>' +
+    (seg.gridPrompt ? '<p><small>四宫格总提示词</small>' + E(seg.gridPrompt) + '</p>' : '') + '</div></aside>';
 }
 function queuePanel(p, allParts) {
   const rows = allParts.map(part => {
@@ -232,6 +234,7 @@ function prompts() {
   const edits = p.edits[seg.index] || [];
   const status = edits.at(-1)?.mode === 'deep' ? 'DeepSeek 优化' : edits.length ? '手动编辑' : '画布原稿';
   modal('第 ' + seg.index + ' 段 · 提示词工作台', '<p class="muted">' + status + ' · ' + edits.length + ' 个历史版本</p>' +
+    (seg.gridPrompt ? '<p><small>四宫格总提示词</small>' + E(seg.gridPrompt) + '</p>' : '') +
     (seg.problem ? '<p class="red">' + E(seg.problem) + '</p>' : '') +
     seg.parts.map(part => '<h3>子段 ' + part.id + '</h3><pre class="prompt-preview">' + E(part.prompt) + '</pre>').join('') +
     '<details><summary>编辑逐镜画面与运镜</summary><p class="muted">台词、格位、时长和资产锁由画布数据固定。</p>' +
@@ -291,7 +294,10 @@ function showImportDiagnostic(diagnostic, title, message) {
     '<div>project.json 路径：' + E(d.path || '未找到') + '</div>' +
     '<div>format：' + E(display(d.format)) + '</div><div>version：' + E(display(d.version)) + '</div>' +
     '<div>分段位置：' + E(d.segmentPath || '未获取') + '</div><div>segments 原始数量：' + E(display(d.rawSegments)) + '</div><div>每段镜数：' + E(segments) + '</div>' +
-    '<div>被过滤的段或镜：' + E(filtered) + '</div><div>缺失图片：' + E(missing) + '</div></div>',
+    '<div>被过滤的段或镜：' + E(filtered) + '</div><div>缺失图片：' + E(missing) + '</div>' +
+    (d.library ? '<div>人物库 / 场景库 / 道具库：' + d.library.characters + ' / ' + d.library.scenes + ' / ' + d.library.assets + '</div>' : '') +
+    (d.gridPrompts !== undefined && d.gridPrompts !== null ? '<div>带四宫格总提示词的段：' + d.gridPrompts + ' 段</div>' : '') +
+    (d.bindings?.length ? '<details><summary>每段绑定</summary>' + d.bindings.map(item => '<div>第 ' + item.index + ' 段 · 人物：' + E(item.characters.join('、') || '无') + '；场景与道具：' + E(item.assets.join('、') || '无') + '</div>').join('') + '</details>' : '') + '</div>',
     button('关闭', 'close', 'class="primary"'));
 }
 async function act(action, data) {
