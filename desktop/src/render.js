@@ -1,6 +1,7 @@
 'use strict';
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
 
 function run(ffmpeg, args, cwd) {
@@ -152,8 +153,8 @@ async function assemble({ ffmpeg, output, clips, settings, music, onStage = () =
         chain.push('[v][tail]overlay=enable=between(t\\,0\\,0.2)[mix]');
       }
       await fs.writeFile(path.join(work, 'captions.ass'), subtitleFile(clip.shots, w, h), 'utf8');
-      chain.push((index && dissolve ? '[mix]' : '[v]') + 'ass=filename=captions.ass[out]');
-      const baseAudio = media.audio ? '[0:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration=' + duration + '[bed]' :
+      chain.push((index && dissolve ? '[mix]' : '[v]') + (settings.subtitles === false ? 'null' : 'ass=filename=captions.ass') + '[out]');
+      const baseAudio = media.audio && settings.nativeAudio !== false ? '[0:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration=' + duration + '[bed]' :
         'anullsrc=r=48000:cl=stereo,atrim=duration=' + duration + '[bed]';
       chain.push(baseAudio);
       if (settings.effects) {
@@ -176,7 +177,7 @@ async function assemble({ ffmpeg, output, clips, settings, music, onStage = () =
     const args = ['-f', 'concat', '-safe', '1', '-i', 'concat.txt'];
     if (music) {
       args.push('-stream_loop', '-1', '-i', music, '-filter_complex',
-        '[1:a]volume=0.20[music];[0:a][music]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:latency=1[a]',
+        '[1:a]volume=' + ((settings.musicVolume ?? 20) / 100) + '[music];[0:a][music]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:latency=1[a]',
         '-map', '0:v:0', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k');
     } else {
       args.push('-map', '0:v:0', '-map', '0:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k');
@@ -193,5 +194,26 @@ async function assemble({ ffmpeg, output, clips, settings, music, onStage = () =
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
   }
 }
-module.exports = { assemble, effectFor, probe, soundTrack, subtitleFile };
+async function upscaleEpisode(ffmpeg, source, output) {
+  const work = path.dirname(output);
+  if (path.resolve(source).toLowerCase() === path.resolve(output).toLowerCase()) throw Error('请选择不同的输出文件。');
+  const input = await probe(ffmpeg, source, work);
+  if (!input.width || !input.height || !input.duration) throw Error('无法读取整集视频。');
+  const portrait = input.height >= input.width;
+  const width = portrait ? 1080 : 1920;
+  const height = portrait ? 1920 : 1080;
+  if (Math.min(width / input.width, height / input.height) <= 1) throw Error('成片已达到这个高清尺寸，建议保存原文件。');
+  const temp = path.join(work, '.duanju-' + randomUUID() + '.mp4');
+  try {
+    await encode(ffmpeg, ['-i', source, '-map', '0:v:0', '-map', '0:a?', '-vf',
+      'scale=' + width + ':' + height + ':flags=lanczos:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1',
+      '-c:v', 'libx264', '-threads', '4', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
+      '-c:a', 'copy', '-movflags', '+faststart', temp], work, '本地高清导出');
+    const meta = await probe(ffmpeg, temp, work);
+    if (!meta.width || !meta.height || !meta.duration) throw Error('高清文件无法读取。');
+    await fs.rename(temp, output);
+    return meta;
+  } finally { await fs.rm(temp, { force: true }).catch(() => {}); }
+}
+module.exports = { assemble, effectFor, probe, soundTrack, subtitleFile, upscaleEpisode };
 

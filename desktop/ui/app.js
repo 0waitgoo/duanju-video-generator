@@ -46,7 +46,7 @@ function selectOptions(values, current) {
   return values.map(([value, label]) => '<option value="' + E(value) + '"' + (value === current ? ' selected' : '') + '>' + E(label) + '</option>').join('');
 }
 function renderProjects() {
-  const markup = state.projects.map(p => button('<strong>' + E(p.canvasName) + '</strong><span>' +
+  const markup = state.projects.map(p => button('<strong>' + E(p.canvasName) + '</strong><span>v' + (p.revision || 1) + ' · ' +
     p.segments.length + ' 段 · ' + p.segments.reduce((sum, s) => sum + s.shots.length, 0) + ' 镜</span>',
   'project', 'class="project-button ' + (p.id === current ? 'active' : '') + '" data-id="' + E(p.id) + '"')).join('');
   if ($('#projects').innerHTML !== markup) $('#projects').innerHTML = markup;
@@ -75,7 +75,8 @@ function inspector(p, seg, shot) {
   const dialogue = shot.dialogue?.text?.trim() ? '<p class="dialogue"><small>台词</small>💬 ' +
     E((shot.dialogue.speaker ? shot.dialogue.speaker + '：' : '') + shot.dialogue.text) + '</p>' : '<p class="muted">无台词</p>';
   return '<aside class="panel inspector"><header class="panel-head"><h2>第 ' + shot.shotIndex +
-    ' 镜</h2><span class="mono muted">' + E(seconds(shot.durationSec)) + '</span></header><div class="inspect-body">' +
+    ' 镜</h2><div class="panel-tools"><span class="mono muted">' + E(seconds(shot.durationSec)) + '</span>' +
+    button('编辑分镜', 'shot-edit') + '</div></header><div class="inspect-body">' +
     '<p><small>画面 · ' + E(shot.framing) + '</small>' + E(shot.visual || '—') + '</p>' +
     '<p><small>分镜提示词</small>' + E(shot.prompt || '—') + '</p>' + dialogue +
     '<p><small>运镜</small>' + E(shot.camera || '—') + '</p><p><small>音效</small>' + E(shot.sfx || '—') + '</p>' +
@@ -88,17 +89,28 @@ function queuePanel(p, allParts) {
     const job = p.jobs[part.id];
     const stateClass = ['failed', 'uncertain'].includes(job?.status) ? 'red' : job?.status === 'done' ? 'green' : 'muted';
     const status = labels[job?.status] || '未提交';
-    const controls = job?.status === 'done'
-      ? button('预览', 'clip', 'data-part="' + part.id + '"') + button('保存', 'save-clip', 'data-part="' + part.id + '"')
-      : ['failed', 'uncertain'].includes(job?.status) ? button(job.status === 'uncertain' ? '核对' : '重试', 'retry', 'data-part="' + part.id + '"') : '';
+    const data = 'data-part="' + part.id + '"';
+    const sampleId = 'sample-' + part.id;
+    const sample = p.jobs[sampleId];
+    const sampleData = 'data-part="' + sampleId + '"';
+    const sampleActions = !sample ? button('480P 小样', 'sample-check', data) :
+      sample.status === 'done' ? button('看小样', 'clip', sampleData) + button('再做小样', 'sample-check', data) :
+      ['failed', 'uncertain'].includes(sample.status) ? button('处理小样', 'retry', sampleData) : '';
+    const controls = (job?.usable ? button(job.versions?.length ? '版本对比' : '预览', job.versions?.length ? 'versions' : 'clip', data) : '') +
+      (!job ? button('生成子段', 'part-check', data) : '') +
+      (job?.status === 'done' ? button('重做', 'redo-check', data) : '') +
+      (['failed', 'uncertain'].includes(job?.status) ? button(job.status === 'uncertain' ? '核对' : '重试', 'retry', data) : '');
     const detail = '#' + part.shots.map(shot => shot.shotIndex).join('、#') + ' · ' + part.duration + ' 秒' +
-      (job ? ' · ' + job.settings.resolution + (job.attempts.length ? ' · 已提交 ' + job.attempts.length + ' 次' : '') : '');
+      (job?.reused ? ' · 已复用' : '') + (job ? ' · ' + job.settings.resolution + (job.attempts.length ? ' · 已提交 ' + job.attempts.length + ' 次' : '') : '');
     return '<div class="queue-row"><div><b>子段 ' + part.id + '</b><div class="' + stateClass + '">' + status +
       '</div></div><div class="detail muted">' + E(detail) +
       (job?.error ? '<div class="red">' + E(job.error.message + (job.error.code ? '（' + job.error.code + '）' : '')) + '</div>' : '') +
-      '</div><div class="controls">' + controls + '</div></div>';
+      (job && job.prompt !== part.prompt ? '<div class="yellow">分镜提示已更新，可重做应用到新视频。</div>' : '') +
+      (sample ? '<div>480P 小样 · ' + E(labels[sample.status] || sample.status) +
+        (sample.error ? ' · ' + E(sample.error.message) : '') + '</div>' : '') +
+      '</div><div class="controls">' + controls + sampleActions + '</div></div>';
   }).join('');
-  const done = allParts.filter(part => p.jobs[part.id]?.status === 'done').length;
+  const done = allParts.filter(part => p.jobs[part.id]?.usable).length;
   return '<section class="panel"><header class="panel-head"><h2>生成队列</h2><span class="mono muted">' + done + ' / ' +
     allParts.length + ' 已完成</span></header><div class="queue-scroll">' + (rows || '<div class="empty-small">请先在画布调整分段。</div>') + '</div></section>';
 }
@@ -111,11 +123,17 @@ function resultPanel(p, allParts) {
   if (result.status === 'done') content = '<video id="episode-player" controls preload="metadata" src="' +
     url('episode', p.id, result.name) + '"></video><p class="muted">' + E(seconds(result.duration)) + ' · ' +
     result.width + ' × ' + result.height + ' · ' + E(money(result.size)) + '</p>' +
-    button('保存整集 MP4', 'save-episode', 'class="primary"');
-  const canRebuild = allParts.length > 0 && !p.segments.some(seg => seg.problem) && allParts.every(part => p.jobs[part.id]?.status === 'done') && result.status !== 'rendering';
+    button('验片定位', 'review') + button('保存整集 MP4', 'save-episode', 'class="primary"') +
+    (result.width < (result.height >= result.width ? 1080 : 1920) && result.height < (result.height >= result.width ? 1920 : 1080)
+      ? button('本地转高清', 'hd-check') : '') +
+    (result.mix ? '<p class="muted">字幕 ' + (result.mix.subtitles ? '开启' : '关闭') + ' · 拟音 ' +
+      (result.mix.effects ? '开启' : '关闭') + ' · 配乐 ' + E(result.music || '关闭') + '</p>' : '') +
+    (result.rebuildError ? '<p class="red">重新拼接失败，仍可播放上一次成片。' + E(result.rebuildError) + '</p>' : '') +
+    (p.dirty ? '<p class="notice">采用的片段或导出设置已更新，请重新拼接。</p>' : '');
+  const canRebuild = allParts.length > 0 && !p.segments.some(seg => seg.problem) && allParts.every(part => p.jobs[part.id]?.usable) && result.status !== 'rendering';
   return '<section class="panel"><header class="panel-head"><h2>整集成片</h2><span class="mono muted">MP4</span></header><div class="result">' +
     content + '<p class="muted">' + (p.music ? '配乐 · ' + E(p.music) : '配乐 · 关闭') + '</p><div class="small-buttons">' +
-    button(p.music ? '更换配乐' : '选择配乐', 'music') + (p.music ? button('关闭配乐', 'music-clear', 'class="subtle"') : '') +
+    button('字幕与音轨', 'mix-settings') +
     (canRebuild ? button('重新拼接', 'reassemble') : '') + '</div></div></section>';
 }
 function render() {
@@ -140,7 +158,7 @@ function render() {
   const existingVideo = $('#episode-player');
   const runningText = state.hold || state.queueError;
   const newCount = allParts.filter(part => !p.jobs[part.id]).length;
-  const generateLabel = p.episode.status === 'done' ? '整集已生成' : '一键生成整集';
+  const generateLabel = p.episode.status === 'done' ? '整集已生成' : '检查并生成整集';
   work.innerHTML = '<div class="content"><header class="overview"><div><h1>' + E(p.title) +
     '</h1><div class="canvas">' + E(p.canvasName) + '</div></div><div class="actions">' +
     button('删除', 'remove', 'class="subtle"') + button(generateLabel, 'queue-all', 'class="primary" ' + (p.episode.status === 'done' ? 'disabled' : '')) +
@@ -242,24 +260,111 @@ function prompts() {
       E(edits.at(-1)?.lines[shot.shotIndex] || [shot.camera, shot.visual, shot.prompt].filter(Boolean).join('；')) + '</textarea></label>').join('') + '</details>',
     button('DeepSeek 优化', 'optimize') + (edits.length ? button('回退一版', 'undo') : '') + button('保存编辑', 'save-prompt', 'class="primary"'), 'prompt');
 }
-function confirmQueue(segment) {
+async function confirmQueue(segment, part, mode = 'normal') {
+  const { blockers, ready, reviews, reused, settings } = await invoke('preflight', current, segment, part, mode);
+  const grouped = [...Map.groupBy(reviews, issue => issue.message)].map(([message, entries]) =>
+    '<details><summary>' + E(message) + ' · ' + entries.length + ' 处</summary>' + entries.map(issue =>
+      button('第 ' + issue.segment + ' 段' + (issue.shot ? ' / ' + issue.shot + ' 镜' : ''), 'locate',
+        'data-segment="' + issue.segment + '" data-shot="' + (issue.shot || '') + '"')).join(' ') + '</details>').join('');
+  const references = ready.map(item => '<details><summary>子段 ' + E(item.id) + ' · ' + item.duration + ' 秒 · ' + item.files.length +
+    ' 张参考图</summary><ul>' + item.files.map(file => '<li>' + E(file) + '</li>').join('') + '</ul>' +
+    (item.dropped.length ? '<p class="yellow">超限未提交：' + E(item.dropped.join('、')) + '</p>' : '') + '</details>').join('');
+  const body = '<div class="confirm-list"><h3>必须处理 · ' + blockers.length + '</h3>' +
+    (blockers.length ? '<ul class="red">' + blockers.map(item => '<li>' + E(item) + '</li>').join('') + '</ul>' : '<p class="green">无阻塞项</p>') +
+    '<details><summary>建议复核 · ' + reviews.length + ' 处</summary>' + (grouped || '<p>无</p>') + '</details>' +
+    '<h3>可提交 · ' + ready.length + ' 个子段</h3><p>' + ready.reduce((sum, item) => sum + item.duration, 0) + ' 秒 · ' +
+    E(settings.resolution) + ' · ' + E(settings.ratio) + ' · 已有可用片段 ' + reused + ' 个</p>' + references +
+    (ready.length ? '<p>按 MiniMax 账户资费扣费，部分参考图也可能计费。</p>' : '') +
+    (mode === 'redo' ? '<p>生成后可对比版本，再选入整集。</p>' : '') +
+    (mode === 'sample' ? '<p>小样单独预览，正式子段仍可按设定分辨率生成。</p>' : '') + '</div>';
+  const attrs = 'data-part="' + E(part || '') + '" data-segment="' + (segment || '') + '"';
+  const title = part ? (mode === 'sample' ? '480P 小样 · ' : mode === 'redo' ? '重做子段 · ' : '检查并生成子段 · ') + part :
+    segment ? '检查第 ' + segment + ' 段' : '整集生成前检查';
+  modal(title, body,
+    button('取消', 'close') + (!state.settings.miniSuffix ? button('打开设置', 'settings') : '') +
+    button(mode === 'redo' ? '确认重做' : '确认生成', mode === 'redo' ? 'redo-now' : mode === 'sample' ? 'sample-now' : 'start',
+      'class="primary" ' + attrs + (blockers.length ? ' disabled' : '')));
+}
+const shotFields = [['framing', '景别'], ['visual', '画面描述'], ['prompt', '分镜提示词'], ['camera', '运镜'], ['sfx', '音效']];
+function shotEditor() {
+  const { shot } = pick();
+  const fields = shotFields.map(([key, label]) => '<label class="field">' + label +
+    '<textarea id="shot-' + key + '" maxlength="4000">' + E(shot[key]) + '</textarea></label>').join('');
+  modal('编辑第 ' + shot.shotIndex + ' 镜', fields +
+    '<p class="muted">画布原台词与时长保持原样。改动会用于之后提交的生成任务与本地混音。</p>',
+    (shot.originalFields ? button('恢复导入内容', 'shot-reset') : '') + button('保存分镜', 'shot-save', 'class="primary"'));
+}
+function versions(part) {
+  const p = project(), job = p.jobs[part];
+  const entries = [...(job.versions || []), job].filter(item => item.status === 'done');
+  const selected = job.selectedVersion || job.localId;
+  const panels = entries.map((item, index) => {
+    const active = item.localId === selected;
+    const attrs = 'data-part="' + E(part) + '" data-version="' + E(item.localId) + '"';
+    return '<section><h3>版本 ' + (index + 1) + (active ? ' · 当前采用' : '') + '</h3><video controls preload="metadata" src="' +
+      url('clip', p.id, part + ':' + item.localId) + '"></video>' + (active ? '' : button('采用此版本', 'select-version', attrs)) + '</section>';
+  }).join('');
+  modal('子段 ' + part + ' · 版本对比', '<div class="version-grid">' + panels + '</div>' +
+    '<p class="muted">选择其他版本后，可重新拼接更新整集。</p>');
+}
+function reviewEpisode() {
   const p = project();
-  const list = segment ? [p.segments.find(item => item.index === segment)] : p.segments;
-  const bad = list.find(item => item.problem);
-  if (bad) throw Error(bad.problem);
-  const queued = list.flatMap(item => item.parts).filter(part => !p.jobs[part.id]);
-  const duration = queued.reduce((sum, part) => sum + part.duration, 0);
-  const missing = [['miniSuffix', 'MiniMax'], ['deepSuffix', 'DeepSeek']].filter(([field]) => !state.settings[field]).map(([, label]) => label);
-  if (missing.length) {
-    modal('请先填写 Key', '<p>缺少 ' + E(missing.join('、')) + ' Key。请在设置填入后再生成。</p>', button('打开设置', 'settings', 'class="primary"'));
-    return;
+  let offset = 0;
+  const entries = (p.episode.timeline || p.segments.flatMap(seg => seg.parts)).map(part => {
+    const start = offset;
+    offset += part.seconds;
+    return { ...part, start, end: offset };
+  });
+  modal('验片定位', '<video id="review-player" class="modal-video" controls preload="metadata" src="' +
+    url('episode', p.id, p.episode.name) + '"></video><p class="muted">按分镜计划时长定位，实际切镜可能偏移。</p>' +
+    '<label class="field">跳到子段<select id="review-part">' + entries.map((entry, index) => '<option value="' + index + '">' +
+    E(seconds(entry.start) + ' · 子段 ' + entry.id) + '</option>').join('') + '</select></label><div id="review-detail"></div>');
+  const player = $('#review-player'), select = $('#review-part'), detail = $('#review-detail');
+  let shown = -1;
+  const update = index => {
+    if (!entries[index] || index === shown) return;
+    shown = index;
+    select.value = String(index);
+    const entry = entries[index];
+    const segment = p.segments.find(item => item.index === entry.segment);
+    const part = segment?.parts.find(item => item.id === entry.id);
+    detail.innerHTML = '<div class="review-detail">' +
+      (segment?.gridImage && p.images[segment.gridImage] ? '<img alt="四宫格参考图" src="' + url('image', p.id, segment.gridImage) + '">' : '') +
+      '<div>' + (part?.shots || []).map(shot => button('第 ' + shot.shotIndex + ' 镜', 'locate',
+        'data-segment="' + segment.index + '" data-shot="' + shot.shotIndex + '"')).join(' ') +
+      (entry.version ? '<details><summary>成片采用的提示词</summary><pre class="prompt-preview">' + E(entry.prompt) + '</pre></details>' : '') +
+      '</div></div>';
+  };
+  player.addEventListener('timeupdate', () => update(entries.findIndex(item => player.currentTime >= item.start && player.currentTime < item.end)));
+  select.addEventListener('change', () => {
+    const index = Number(select.value);
+    player.currentTime = entries[index].start;
+    update(index);
+  });
+  update(0);
+}
+function mixSettings() {
+  const p = project(), mix = p.mix;
+  const clips = Object.values(p.jobs).filter(job => job.usable).map(job => job.selectedVersion ?
+    job.versions?.find(item => item.localId === job.selectedVersion) : job);
+  const native = clips.filter(clip => clip?.hasAudio).length;
+  const unknown = clips.filter(clip => clip?.hasAudio === undefined).length;
+  const toggle = (key, label) => '<label class="switch"><input type="checkbox" id="mix-' + key + '" ' + (mix[key] ? 'checked' : '') + '> ' + label + '</label>';
+  const music = p.music ? '<p>' + E(p.music) + '</p><audio id="music-preview" controls preload="none" src="' + url('music', p.id) +
+    '"></audio>' : '<p class="muted">配乐关闭</p>';
+  modal('字幕与音轨', toggle('subtitles', '烧录计划时间轴字幕') + toggle('nativeAudio', '保留片段已有的原生声音') +
+    '<p class="muted">当前采用的片段中，' + native + ' 个有原生音轨' + (unknown ? '，' + unknown + ' 个旧片段音轨未记录' : '') + '。</p>' +
+    toggle('effects', '混入分镜拟音') + music + '<label class="field">配乐音量（%）<input id="mix-volume" type="number" min="0" max="100" value="' +
+    mix.musicVolume + '"></label><p class="muted">配乐可单独试听。保存设置后可用已有片段重新拼接，再试听完整混音。</p>',
+    button(p.music ? '更换配乐' : '选择配乐', 'music') + (p.music ? button('关闭配乐', 'music-clear') : '') +
+    button('保存设置', 'save-mix', 'class="primary"'), 'mix');
+  const audio = $('#music-preview');
+  if (audio) {
+    const volume = $('#mix-volume');
+    const apply = () => { audio.volume = Math.max(0, Math.min(100, Number(volume.value))) / 100; };
+    volume.addEventListener('input', apply);
+    apply();
   }
-  modal(segment ? '生成第 ' + segment + ' 段' : '一键生成整集', '<p>' +
-    (queued.length ? '即将向 MiniMax 提交 ' + queued.length + ' 个子段。' : '已有的子段会继续处理或复用。') + '</p>' +
-    '<div class="confirm-list"><div>本次提交总时长 · ' + duration + ' 秒</div><div>分辨率 · ' + E(state.settings.resolution) + ' · ' +
-    E(state.settings.ratio) + '</div>' + (queued.length ? '<div>按 MiniMax 账户当前资费扣费，部分参考图也可能计费。</div>' : '') +
-    (segment ? '' : '<div>全部完成后自动拼接、烧录字幕并混音。</div>') + '</div>',
-    button('取消', 'close') + button('确认生成', 'start', 'class="primary" data-segment="' + (segment || '') + '"'));
 }
 function retry(part) {
   const job = project().jobs[part];
@@ -279,7 +384,9 @@ async function importZip(file) {
     current = result.id;
     selection = 1;
     await refresh();
-    showImportDiagnostic(project()?.diagnostic, '导入成功', result.replaced ? '已替换同一画布项目。' : '画布项目已导入。');
+    showImportDiagnostic(project()?.diagnostic, '导入成功', result.revision > 1 ?
+      '已导入第 ' + result.revision + ' 版，旧版已保留。已复用：' + (result.reused.join('、') || '无') +
+      '。待生成或检查：' + (result.pending.join('、') || '无') + '。' : '画布项目已导入。');
   } catch (error) {
     showImportDiagnostic(error.diagnostic, '导入失败', error.message);
   } finally { importPending = false; }
@@ -316,14 +423,40 @@ async function act(action, data) {
       break;
     case 'import': await importZip(); break;
     case 'remove': if (await invoke('remove', current)) { current = ''; await refresh(); } break;
-    case 'queue-all': confirmQueue(); break;
-    case 'queue-one': confirmQueue(seg.index); break;
+    case 'queue-all': await confirmQueue(); break;
+    case 'queue-one': await confirmQueue(seg.index); break;
+    case 'part-check':
+    case 'sample-check': {
+      const segment = p.segments.find(item => item.parts.some(part => part.id === data.part));
+      await confirmQueue(segment.index, data.part, action === 'sample-check' ? 'sample' : 'normal');
+      break;
+    }
+    case 'sample-now': await invoke('sample', current, Number(data.segment), data.part); close(); await refresh(); break;
+    case 'redo-check': await confirmQueue(p.jobs[data.part].segment, data.part, 'redo'); break;
+    case 'redo-now': await invoke('redo', current, data.part); close(); await refresh(); break;
+    case 'versions': versions(data.part); break;
+    case 'select-version': await invoke('select-clip', current, data.part, data.version); close(); await refresh(); notify('已选用该版本，可重新拼接。'); break;
+    case 'review': reviewEpisode(); break;
+    case 'mix-settings': mixSettings(); break;
+    case 'save-mix': {
+      const mix = Object.fromEntries(['subtitles', 'nativeAudio', 'effects'].map(key => [key, $('#mix-' + key).checked]));
+      await invoke('mix', current, { ...mix, musicVolume: $('#mix-volume').valueAsNumber });
+      close(); await refresh(); break;
+    }
     case 'start': {
-      const count = await invoke('queue', current, Number(data.segment) || undefined);
+      const count = await invoke('queue', current, Number(data.segment) || undefined, data.part || undefined);
       close(); await refresh(); notify(count ? '已将 ' + count + ' 个子段加入队列。' : '正在处理已有子段。');
       break;
     }
     case 'prompt': prompts(); break;
+    case 'shot-edit': shotEditor(); break;
+    case 'shot-reset':
+    case 'shot-save': {
+      const { shot } = pick();
+      const input = action === 'shot-reset' ? null : Object.fromEntries(shotFields.map(([key]) => [key, $('#shot-' + key).value]));
+      await invoke('edit-shot', current, seg.index, shot.shotIndex, input);
+      close(); await refresh(); notify('分镜已更新。'); break;
+    }
     case 'save-settings': await saveSettings(); close(); notify('设置已保存。'); break;
     case 'key-link': await invoke('key-link', data.kind); break;
     case 'test': {
@@ -345,12 +478,23 @@ async function act(action, data) {
       modal('子段 ' + data.part, '<video class="modal-video" controls preload="metadata" src="' + url('clip', current, data.part) + '"></video>',
         button('保存子段 MP4', 'save-clip', 'class="primary" data-part="' + data.part + '"'));
       break;
+    case 'hd-check':
+      modal('本地转高清', '<p>使用本机 FFmpeg 放大成片，保持比例并保留原音轨和字幕画面。竖屏 9:16 输出 1080 × 1920。放大不会恢复原视频缺失的细节。</p>',
+        button('选择保存位置', 'save-hd', 'class="primary"'));
+      break;
+    case 'save-hd': {
+      $('#modal-status').textContent = '选择保存位置后将在本机处理…';
+      const hd = await invoke('export', 'hd', current);
+      if (hd) { close(); notify('已保存高清 MP4 · ' + hd.width + ' × ' + hd.height); }
+      else if (dialog.open && $('#modal-status')) $('#modal-status').textContent = '';
+      break;
+    }
     case 'save-clip':
     case 'save-episode':
       if (await invoke('export', action === 'save-clip' ? 'clip' : 'episode', current, data.part)) notify('MP4 已保存。');
       break;
-    case 'music': await invoke('music', current, false); await refresh(); break;
-    case 'music-clear': await invoke('music', current, true); await refresh(); break;
+    case 'music': await invoke('music', current, false); await refresh(); if (openModal === 'mix') mixSettings(); break;
+    case 'music-clear': await invoke('music', current, true); await refresh(); if (openModal === 'mix') mixSettings(); break;
     case 'reassemble': await invoke('reassemble', current); await refresh(); break;
     case 'save-prompt': {
       const values = Object.fromEntries([...dialog.querySelectorAll('[data-edit]')].map(item => [item.dataset.edit, item.value]));

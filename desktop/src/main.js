@@ -5,6 +5,7 @@ const { createReadStream } = require('node:fs');
 const { Readable } = require('node:stream');
 const path = require('node:path');
 const { Workspace } = require('./workspace');
+const { upscaleEpisode } = require('./render');
 const { imageType } = require('./project');
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'studio', privileges: {
@@ -33,7 +34,8 @@ async function serve(request) {
     const [id, item = ''] = url.pathname.slice(1).split('/').map(decodeURIComponent);
     const file = workspace.pathFor(url.hostname, id, item);
     const size = (await fs.stat(file)).size;
-    const headers = { 'Content-Type': imageType(file) || 'video/mp4', 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' };
+    const audio = { '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.flac': 'audio/flac', '.ogg': 'audio/ogg' };
+    const headers = { 'Content-Type': imageType(file) || audio[path.extname(file)] || 'video/mp4', 'Accept-Ranges': 'bytes', 'Cache-Control': 'no-store' };
     let start = 0, end = size - 1, status = 200;
     const range = request.headers.get('range');
     if (range) {
@@ -84,7 +86,13 @@ function attachHandlers() {
   handle('settings', input => workspace.setSettings(input));
   handle('test', kind => workspace.testConnection(kind));
   handle('key-link', kind => keyLinks[kind] && shell.openExternal(keyLinks[kind]));
-  handle('queue', (id, segment) => workspace.queue(id, segment));
+  handle('queue', (id, segment, part) => workspace.queue(id, segment, part));
+  handle('preflight', (id, segment, part, mode) => workspace.preflight(id, segment, part, mode));
+  handle('sample', (id, segment, part) => workspace.queueSample(id, segment, part));
+  handle('edit-shot', (id, segment, shot, input) => workspace.editShot(id, segment, shot, input));
+  handle('redo', (id, part) => workspace.redo(id, part));
+  handle('select-clip', (id, part, version) => workspace.selectClip(id, part, version));
+  handle('mix', (id, mix) => workspace.setMix(id, mix));
   handle('resume', () => workspace.resume());
   handle('retry', (id, part, remote) => workspace.retry(id, part, remote));
   handle('edit', (id, segment, lines, mode) => workspace.edit(id, segment, lines, mode));
@@ -97,13 +105,14 @@ function attachHandlers() {
     if (!result.canceled) return workspace.setMusic(id, result.filePaths[0]);
   });
   handle('export', async (type, id, item) => {
-    if (!['clip', 'episode'].includes(type)) throw Error('只能导出视频。');
-    const file = workspace.pathFor(type, id, item);
+    if (!['clip', 'episode', 'hd'].includes(type)) throw Error('只能导出视频。');
+    const file = workspace.pathFor(type === 'hd' ? 'episode' : type, id, item);
     const title = workspace.project(id).title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 80).replace(/[. ]+$/, '') || '成片';
-    const name = title + (type === 'episode' ? '' : '-子段-' + item) + '.mp4';
+    const name = title + (type === 'hd' ? '-本地高清' : type === 'clip' ? '-子段-' + item : '') + '.mp4';
     const result = await dialog.showSaveDialog(window, { title: '保存 MP4', defaultPath: name,
       filters: [{ name: 'MP4 视频', extensions: ['mp4'] }] });
     if (!result.canceled) {
+      if (type === 'hd') return upscaleEpisode(workspace.ffmpeg, file, result.filePath);
       if (path.resolve(file) !== path.resolve(result.filePath)) await fs.copyFile(file, result.filePath);
       return true;
     }

@@ -1,6 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { existsSync } = require('node:fs');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
@@ -12,9 +13,20 @@ const ffmpeg = path.join(__dirname, '..', 'build', 'runtime', 'ffmpeg.exe');
 const projectIO = require('../src/project');
 const provider = require('../src/providers');
 const { Workspace } = require('../src/workspace');
-const { probe, subtitleFile } = require('../src/render');
+const { probe, subtitleFile, upscaleEpisode } = require('../src/render');
 const run = promisify(execFile);
 const fixture = path.join(fixtures || '', '示例包', 'test-package.zip');
+test('本地高清导出保留音轨、时长与竖屏比例', async t => {
+  const root = await temp(t);
+  const source = path.join(root, 'source.mp4');
+  const dest = path.join(root, '高清.mp4');
+  await run(ffmpeg, ['-loglevel', 'error', '-f', 'lavfi', '-i', 'color=red:s=180x320:r=24',
+    '-f', 'lavfi', '-i', 'sine=f=440', '-t', '0.5', '-c:v', 'libx264', '-c:a', 'aac', source]);
+  const result = await upscaleEpisode(ffmpeg, source, dest);
+  assert.deepEqual([result.width, result.height, result.audio], [1080, 1920, true]);
+  assert.ok(Math.abs(result.duration - (await probe(ffmpeg, source, root)).duration) < 0.05);
+  await assert.rejects(upscaleEpisode(ffmpeg, source, source), /不同的输出文件/);
+});
 const cryptoDouble = {
   isEncryptionAvailable: () => true,
   encryptString: value => Buffer.from(value, 'utf8').reverse(),
@@ -80,7 +92,9 @@ test('真实交接 ZIP：2 段 8 镜、逐字提示词、稳定格位与按需�
   await assert.rejects(provider.prepare({}, second, Array(10).fill('unused'), 10), /1–9/);
 });
 
-test('真实交接分镜：逐列比对全部 50 镜，计算场次与人物绑定', { skip: !fixtures }, async () => {
+test('真实交接分镜：逐列比对全部 50 镜，计算场次与人物绑定', {
+  skip: !fixtures || !existsSync(path.join(fixtures, '分镜', '分镜表-50镜.csv')) ? '缺交接分镜表' : false,
+}, async () => {
   const csv = await fs.readFile(path.join(fixtures, '分镜', '分镜表-50镜.csv'), 'utf8');
   const script = await fs.readFile(path.join(fixtures, '剧本', '《末日游戏》第一集v2.md'), 'utf8');
   const scenes = projectIO.readStoryboard(csv);
@@ -112,8 +126,8 @@ test('鉴权失败暂停、缺 Key 拦截、单段筛选和重复导入', { skip
   const { id } = added;
   assert.throws(() => work.queue(id), /缺少 MiniMax Key/);
   work.setSettings({ mini: 'fake-mini-secret', concurrency: 1 });
-  assert.throws(() => work.queue(id), /缺少 DeepSeek Key/);
-  keys(work);
+  assert.equal(work.preflight(id, 2).blockers.length, 0);
+  assert.equal(work.preflight(id, 2).ready.length, 1);
   assert.equal(work.snapshot().settings.miniSuffix, 'cret');
   assert.ok(!(await fs.readFile(work.stateFile, 'utf8')).includes('fake-mini-secret'));
   assert.equal(work.queue(id, 2), 1);
@@ -122,9 +136,74 @@ test('鉴权失败暂停、缺 Key 拦截、单段筛选和重复导入', { skip
   assert.equal(Object.keys(work.project(id).jobs).length, 1);
   assert.throws(() => work.queue(id), /暂停/);
   const replaced = await work.import(fixture);
-  assert.equal(replaced.replaced, true);
+  assert.equal(replaced.revision, 2);
   assert.notEqual(replaced.id, id);
-  assert.equal(work.data.projects.length, 1);
+  assert.equal(work.data.projects.length, 2);
+});
+
+test('独立子段、480P 小样与分镜编辑互不覆盖', { skip: !fixtures }, async t => {
+  const root = await temp(t);
+  const work = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg });
+  work.setSettings({ mini: 'fake-mini-secret' });
+  work.tick = () => {};
+  const { id } = await work.import(fixture);
+  const project = work.project(id);
+  const shot = project.segments[0].shots[3];
+  const original = { ...shot };
+  work.editShot(id, 1, shot.shotIndex, { ...shot, visual: '小雅转向镜头', camera: '缓慢推镜' });
+  assert.deepEqual(shot.dialogue, original.dialogue);
+  assert.equal(shot.durationSec, original.durationSec);
+  const preflight = work.preflight(id, 1, '1-2', 'sample');
+  assert.deepEqual(preflight.ready.map(item => item.id), ['1-2']);
+  assert.equal(preflight.settings.resolution, '480P');
+  work.queueSample(id, 1, '1-2');
+  assert.deepEqual(Object.keys(project.jobs), ['sample-1-2']);
+  const sample = project.jobs['sample-1-2'];
+  assert.match(sample.prompt, /小雅转向镜头/);
+  assert.equal(sample.settings.resolution, '480P');
+  const body = JSON.parse(await provider.prepare(sample.settings, sample.prompt,
+    sample.refs.map(ref => path.join(work.projectsDir, id, ref)), sample.duration));
+  assert.equal(body.resolution, '480P');
+  assert.equal(body.model, 'MiniMax-H3');
+  work.editShot(id, 1, shot.shotIndex, null);
+  assert.equal(shot.visual, original.visual);
+  assert.equal(work.queue(id, 1, '1-2'), 1);
+  assert.deepEqual(Object.keys(project.jobs), ['sample-1-2', '1-2']);
+  assert.equal(project.jobs['1-2'].settings.resolution, '768P');
+  assert.equal(project.autoAssemble, false);
+});
+
+test('重做保留旧片，主动选择新片，同一输入才复用', { skip: !fixtures }, async t => {
+  const root = await temp(t);
+  const work = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg });
+  work.setSettings({ mini: 'fake-mini-secret' });
+  work.tick = () => {};
+  const { id } = await work.import(fixture);
+  const project = work.project(id);
+  work.queue(id, 2);
+  const original = project.jobs['2-1'];
+  const folder = path.join(work.downloads, id);
+  await fs.mkdir(folder);
+  await fs.writeFile(path.join(folder, 'old.mp4'), 'old fixture');
+  Object.assign(original, { status: 'done', file: 'old.mp4' });
+  work.redo(id, '2-1');
+  const next = project.jobs['2-1'];
+  assert.notEqual(next.localId, original.localId);
+  assert.equal(work.pathFor('clip', id, '2-1'), path.join(folder, 'old.mp4'));
+  assert.equal(work.snapshot().projects[0].jobs['2-1'].usable, true);
+  await fs.writeFile(path.join(folder, 'new.mp4'), 'new fixture');
+  Object.assign(next, { status: 'done', file: 'new.mp4' });
+  work.selectClip(id, '2-1', next.localId);
+  assert.equal(work.pathFor('clip', id, '2-1'), path.join(folder, 'new.mp4'));
+  assert.equal(work.pathFor('clip', id, '2-1:' + original.localId), path.join(folder, 'old.mp4'));
+  const newer = await work.import(fixture);
+  assert.deepEqual(newer.reused, ['2-1']);
+  assert.equal(await fs.readFile(work.pathFor('clip', newer.id, '2-1'), 'utf8'), 'new fixture');
+  work.setSettings({ ratio: '16:9' });
+  const changed = await work.import(fixture);
+  assert.deepEqual(changed.reused, []);
+  assert.ok(changed.pending.includes('2-1'));
+  assert.equal(await fs.readFile(work.pathFor('clip', id, '2-1'), 'utf8'), 'new fixture');
 });
 
 test('重启恢复远端任务，单独重试过期段并自动导出真实本地 MP4', { skip: !fixtures }, async t => {
