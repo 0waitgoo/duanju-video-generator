@@ -85,6 +85,8 @@ function attachHandlers() {
   });
   handle('settings', input => workspace.setSettings(input));
   handle('test', kind => workspace.testConnection(kind));
+  handle('refresh-models', kind => workspace.refreshModels(kind));
+  handle('cleanup-versions', id => workspace.cleanupOldVersions(id));
   handle('key-link', kind => keyLinks[kind] && shell.openExternal(keyLinks[kind]));
   handle('queue', (id, segment, part) => workspace.queue(id, segment, part));
   handle('preflight', (id, segment, part, mode) => workspace.preflight(id, segment, part, mode));
@@ -112,7 +114,9 @@ function attachHandlers() {
     const result = await dialog.showSaveDialog(window, { title: '保存 MP4', defaultPath: name,
       filters: [{ name: 'MP4 视频', extensions: ['mp4'] }] });
     if (!result.canceled) {
-      if (type === 'hd') return upscaleEpisode(workspace.ffmpeg, file, result.filePath);
+      if (type === 'hd') return upscaleEpisode(workspace.ffmpeg, file, result.filePath, pct => {
+        if (window && !window.isDestroyed()) window.webContents.send('hd-progress', Math.round(pct * 100));
+      });
       if (path.resolve(file) !== path.resolve(result.filePath)) await fs.copyFile(file, result.filePath);
       return true;
     }

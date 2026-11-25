@@ -10,11 +10,12 @@ const media = require('./render');
 
 const defaults = {
   base: 'https://api.minimax.io', resolution: '768P', ratio: '9:16', generateAudio: false,
-  concurrency: 2, transition: 'dissolve', effects: true, deepModel: 'deepseek-chat',
+  concurrency: 2, transition: 'dissolve', effects: true, miniModel: 'MiniMax-H3', deepModel: 'deepseek-chat',
+  miniModels: ['MiniMax-H3', 'MiniMax-H3-Max'], deepModels: ['deepseek-chat', 'deepseek-reasoner'],
 };
 const keyLabels = { mini: 'MiniMax', deep: 'DeepSeek' };
 const activeStates = ['submitting', 'remote'];
-const submissionSettings = ({ base, ratio, resolution, generateAudio }) => ({ base, ratio, resolution, generateAudio });
+const submissionSettings = ({ base, ratio, resolution, generateAudio, miniModel }) => ({ base, ratio, resolution, generateAudio, model: miniModel });
 const selectedClip = job => job?.selectedVersion ? job.versions?.find(version => version.localId === job.selectedVersion) :
   job?.status === 'done' ? job : null;
 const sampleJobId = partId => 'sample-' + partId;
@@ -87,7 +88,8 @@ class Workspace {
   setSettings(input) {
     const current = this.settings();
     const choices = { base: defaultProvider.BASES, resolution: ['768P', '2K'],
-      ratio: ['9:16', '16:9', '1:1', 'adaptive'], transition: ['dissolve', 'cut'], deepModel: ['deepseek-chat', 'deepseek-flash'] };
+      ratio: ['9:16', '16:9', '1:1', 'adaptive'], transition: ['dissolve', 'cut'],
+      miniModel: current.miniModels || [], deepModel: current.deepModels || [] };
     for (const [field, allowed] of Object.entries(choices)) {
       if (allowed.includes(input[field])) current[field] = input[field];
     }
@@ -112,6 +114,23 @@ class Workspace {
   async testConnection(kind) {
     const key = this.requireKey(kind);
     return kind === 'mini' ? this.provider.testMiniMax(this.settings().base, key) : this.provider.testDeepSeek(key);
+  }
+  async refreshModels(kind) {
+    if (!Object.hasOwn(keyLabels, kind)) throw Error('未知服务商。');
+    const key = this.requireKey(kind);
+    const listFn = kind === 'mini' ? this.provider.listMiniMaxModels : this.provider.listDeepSeekModels;
+    if (typeof listFn !== 'function') throw Error('当前版本不支持获取模型列表。');
+    const current = this.settings();
+    const list = kind === 'mini' ? await listFn(current.base, key) : await listFn(key);
+    if (!list.length) throw Error('该账号下没有可用模型，请检查 Key 权限。');
+    const field = kind === 'mini' ? 'miniModels' : 'deepModels';
+    const modelField = kind === 'mini' ? 'miniModel' : 'deepModel';
+    const previous = this.data;
+    const settings = { ...current, [field]: list };
+    if (!list.includes(settings[modelField])) settings[modelField] = list[0];
+    this.data = { ...previous, settings };
+    try { this.save(); } catch (error) { this.data = previous; throw error; }
+    return { models: list, model: settings[modelField] };
   }
   project(id) {
     const project = this.data.projects.find(entry => entry.id === id);
@@ -237,6 +256,21 @@ class Workspace {
     this.data.projects = previous.filter(entry => entry.id !== id);
     try { this.save(); } catch (error) { this.data.projects = previous; throw error; }
     await this.clean(project);
+  }
+  async cleanupOldVersions(id) {
+    const project = this.project(id);
+    const sameCanvas = entry => project.canvasId && entry.canvasId ? entry.canvasId === project.canvasId :
+      entry.canvasName === project.canvasName;
+    const old = this.data.projects.filter(entry => entry.id !== id && sameCanvas(entry));
+    for (const entry of old) {
+      if (this.busy(entry)) throw Error('旧版「' + entry.canvasName + '」仍在生成，请等队列完成再清理。');
+    }
+    if (!old.length) return { removed: 0 };
+    const previous = this.data.projects;
+    this.data.projects = previous.filter(entry => !old.includes(entry));
+    try { this.save(); } catch (error) { this.data.projects = previous; throw error; }
+    for (const entry of old) await this.clean(entry);
+    return { removed: old.length };
   }
   async setMusic(id, input) {
     const project = this.project(id);

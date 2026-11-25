@@ -60,7 +60,7 @@ async function prepare(settings, text, references, duration) {
     content.push({ type: 'image_url', image_url, role: 'reference_image' });
   }
   const body = JSON.stringify({
-    model: 'MiniMax-H3', content, duration, resolution: settings.resolution,
+    model: settings.miniModel || 'MiniMax-H3', content, duration, resolution: settings.resolution,
     ratio: settings.ratio, generate_audio: settings.generateAudio,
   });
   if (Buffer.byteLength(body) > 64 * 1024 ** 2) throw Error('请求体超过 64 MB。');
@@ -102,6 +102,23 @@ async function testMiniMax(base, key) {
   await json(base + '/v2/query/video_generation?page_num=1&page_size=1', key);
   return 'MiniMax 查询鉴权通过。按量付费权限由生成接口确认。';
 }
+const MINI_VIDEO_MODELS = ['MiniMax-H3', 'MiniMax-H3-Max'];
+const DEEP_MODELS = ['deepseek-chat', 'deepseek-reasoner'];
+const modelIds = data => {
+  const list = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
+  return [...new Set(list.map(item => typeof item === 'string' ? item : item?.id)
+    .filter(id => typeof id === 'string' && id))];
+};
+async function listMiniMaxModels(base, key) {
+  const data = await json(base + '/v1/models', key);
+  const ids = modelIds(data).filter(id => /h3/i.test(id) && !/image/i.test(id));
+  return ids.length ? ids : MINI_VIDEO_MODELS;
+}
+async function listDeepSeekModels(key) {
+  const data = await json(DEEPSEEK + '/models', key);
+  const ids = modelIds(data);
+  return ids.length ? ids : DEEP_MODELS;
+}
 async function deepChat(key, model, messages) {
   const response = await json(DEEPSEEK + '/chat/completions', key, JSON.stringify({
     model, messages, temperature: 0.2, max_tokens: 1200,
@@ -124,5 +141,6 @@ async function optimize(key, model, shot) {
   return result.replace(/[\r\n]+/g, ' ').trim();
 }
 
-module.exports = { BASES, create, download, fileUrl, isAuth, isExpired, optimize, prepare, query, testDeepSeek, testMiniMax };
+module.exports = { BASES, create, download, fileUrl, isAuth, isExpired, optimize, prepare, query, testDeepSeek, testMiniMax,
+  listMiniMaxModels, listDeepSeekModels, MINI_VIDEO_MODELS, DEEP_MODELS };
 

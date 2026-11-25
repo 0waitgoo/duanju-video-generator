@@ -161,7 +161,7 @@ function render() {
   const generateLabel = p.episode.status === 'done' ? '整集已生成' : '检查并生成整集';
   work.innerHTML = '<div class="content"><header class="overview"><div><h1>' + E(p.title) +
     '</h1><div class="canvas">' + E(p.canvasName) + '</div></div><div class="actions">' +
-    button('删除', 'remove', 'class="subtle"') + button(generateLabel, 'queue-all', 'class="primary" ' + (p.episode.status === 'done' ? 'disabled' : '')) +
+    button('清理旧版', 'cleanup-versions', 'class="subtle"') + button('删除', 'remove', 'class="subtle"') + button(generateLabel, 'queue-all', 'class="primary" ' + (p.episode.status === 'done' ? 'disabled' : '')) +
     '</div></header><div class="facts"><span><b>' + p.segments.length + '</b>段</span><span><b>' +
     p.segments.reduce((sum, item) => sum + item.shots.length, 0) + '</b>镜</span><span><b>' + E(seconds(measure(p.segments.flatMap(item => item.shots)))) +
     '</b>总长</span><span><b>' + Object.keys(p.images).length + '</b>张图</span><span><b>' + newCount +
@@ -211,21 +211,35 @@ function settings() {
     keyField('deep', 'DeepSeek', s.deepSuffix, '用于提示词优化。')];
   modal('设置', sets.join('') + '<div class="settings-grid">' +
     fieldSelect('site', 'MiniMax 站点', [['https://api.minimax.io','国际站'], ['https://api.minimax.cn','大陆站']], s.base) +
+    fieldSelect('mini-model', 'MiniMax 视频模型', modelOptions(s.miniModels, '先填 Key，再点刷新模型列表'), s.miniModel) +
     fieldSelect('resolution', '视频分辨率', [['768P','768P'],['2K','2K']], s.resolution) +
     fieldSelect('ratio', '画幅', [['9:16','9:16 竖屏'],['16:9','16:9 横屏'],['1:1','1:1 方形'],['adaptive','跟随参考图']], s.ratio) +
     fieldSelect('transition', '子段衔接', [['dissolve','短叠化 · 0.2 秒'],['cut','直接切换']], s.transition) +
-    fieldSelect('deep-model', 'DeepSeek 优化模型', [['deepseek-chat','deepseek-chat · 交接规范'],['deepseek-flash','deepseek-flash · 现行模型']], s.deepModel) +
+    fieldSelect('deep-model', 'DeepSeek 优化模型', modelOptions(s.deepModels, '先填 Key，再点刷新模型列表'), s.deepModel) +
     '<label class="field">同时生成子段数<input id="concurrency" type="number" min="1" max="6" value="' + s.concurrency + '"></label></div>' +
-    '<p class="muted">DeepSeek 已公告停用 deepseek-chat。可切换现行模型，或使用原始提示词。</p>' +
+    '<p class="muted">模型按 Key 自动获取：点「刷新模型列表」拉取该账号可用的模型，再自己选。保存设置后也会自动刷新一次。</p>' +
     '<label class="switch"><input id="h3-audio" type="checkbox" ' + (s.generateAudio ? 'checked' : '') + '> 保留 MiniMax 原生声音</label>' +
     '<label class="switch"><input id="fx" type="checkbox" ' + (s.effects ? 'checked' : '') + '> 自动混入分镜音效</label>',
-    (state.hold ? button('恢复队列', 'resume') : '') + button('保存设置', 'save-settings', 'class="primary"'), 'settings');
+    (state.hold ? button('恢复队列', 'resume') : '') + button('刷新模型列表', 'refresh-models') +
+    button('保存设置', 'save-settings', 'class="primary"'), 'settings');
+}
+const modelOptions = (models, emptyLabel) => (models && models.length ? models.map(m => [m, m]) : [['', emptyLabel]]);
+async function refreshModelLists() {
+  const notes = [];
+  for (const kind of ['mini', 'deep']) {
+    if (!state.settings[kind + 'Suffix']) continue;
+    try {
+      const result = await invoke('refresh-models', kind);
+      notes.push((kind === 'mini' ? 'MiniMax' : 'DeepSeek') + ' ' + result.models.length + ' 个模型，当前 ' + result.model);
+    } catch (error) { notes.push((kind === 'mini' ? 'MiniMax' : 'DeepSeek') + ' 刷新失败：' + (error.message || error)); }
+  }
+  return notes;
 }
 function settingsInput() {
   return {
     mini: $('#mini').value, deep: $('#deep').value, miniClear: $('#mini-clear').checked, deepClear: $('#deep-clear').checked,
     base: $('#site').value, resolution: $('#resolution').value, ratio: $('#ratio').value, transition: $('#transition').value,
-    deepModel: $('#deep-model').value, concurrency: $('#concurrency').valueAsNumber,
+    miniModel: $('#mini-model').value, deepModel: $('#deep-model').value, concurrency: $('#concurrency').valueAsNumber,
     generateAudio: $('#h3-audio').checked, effects: $('#fx').checked,
   };
 }
@@ -273,7 +287,7 @@ async function confirmQueue(segment, part, mode = 'normal') {
     (blockers.length ? '<ul class="red">' + blockers.map(item => '<li>' + E(item) + '</li>').join('') + '</ul>' : '<p class="green">无阻塞项</p>') +
     '<details><summary>建议复核 · ' + reviews.length + ' 处</summary>' + (grouped || '<p>无</p>') + '</details>' +
     '<h3>可提交 · ' + ready.length + ' 个子段</h3><p>' + ready.reduce((sum, item) => sum + item.duration, 0) + ' 秒 · ' +
-    E(settings.resolution) + ' · ' + E(settings.ratio) + ' · 已有可用片段 ' + reused + ' 个</p>' + references +
+    E(settings.model || '') + ' · ' + E(settings.resolution) + ' · ' + E(settings.ratio) + ' · 已有可用片段 ' + reused + ' 个</p>' + references +
     (ready.length ? '<p>按 MiniMax 账户资费扣费，部分参考图也可能计费。</p>' : '') +
     (mode === 'redo' ? '<p>生成后可对比版本，再选入整集。</p>' : '') +
     (mode === 'sample' ? '<p>小样单独预览，正式子段仍可按设定分辨率生成。</p>' : '') + '</div>';
@@ -354,7 +368,7 @@ function mixSettings() {
     '"></audio>' : '<p class="muted">配乐关闭</p>';
   modal('字幕与音轨', toggle('subtitles', '烧录计划时间轴字幕') + toggle('nativeAudio', '保留片段已有的原生声音') +
     '<p class="muted">当前采用的片段中，' + native + ' 个有原生音轨' + (unknown ? '，' + unknown + ' 个旧片段音轨未记录' : '') + '。</p>' +
-    toggle('effects', '混入分镜拟音') + music + '<label class="field">配乐音量（%）<input id="mix-volume" type="number" min="0" max="100" value="' +
+    toggle('effects', '混入分镜拟音（程序合成）') + '<p class="muted">拟音为程序合成的提示音，不是真实录音。</p>' + music + '<label class="field">配乐音量（%）<input id="mix-volume" type="number" min="0" max="100" value="' +
     mix.musicVolume + '"></label><p class="muted">配乐可单独试听。保存设置后可用已有片段重新拼接，再试听完整混音。</p>',
     button(p.music ? '更换配乐' : '选择配乐', 'music') + (p.music ? button('关闭配乐', 'music-clear') : '') +
     button('保存设置', 'save-mix', 'class="primary"'), 'mix');
@@ -423,6 +437,12 @@ async function act(action, data) {
       break;
     case 'import': await importZip(); break;
     case 'remove': if (await invoke('remove', current)) { current = ''; await refresh(); } break;
+    case 'cleanup-versions': {
+      const result = await invoke('cleanup-versions', current);
+      await refresh();
+      notify(result.removed ? '已清理 ' + result.removed + ' 个旧版。' : '没有旧版可清理。');
+      break;
+    }
     case 'queue-all': await confirmQueue(); break;
     case 'queue-one': await confirmQueue(seg.index); break;
     case 'part-check':
@@ -457,7 +477,20 @@ async function act(action, data) {
       await invoke('edit-shot', current, seg.index, shot.shotIndex, input);
       close(); await refresh(); notify('分镜已更新。'); break;
     }
-    case 'save-settings': await saveSettings(); close(); notify('设置已保存。'); break;
+    case 'save-settings': {
+      await saveSettings();
+      const notes = await refreshModelLists();
+      close();
+      notify('设置已保存。' + (notes.length ? '模型列表：' + notes.join('；') : ''));
+      break;
+    }
+    case 'refresh-models': {
+      const notes = await refreshModelLists();
+      await refresh();
+      if (openModal === 'settings') settings();
+      if ($('#modal-status')) $('#modal-status').textContent = notes.join('；') || '请先填写 Key。';
+      break;
+    }
     case 'key-link': await invoke('key-link', data.kind); break;
     case 'test': {
       await saveSettings();
@@ -484,9 +517,14 @@ async function act(action, data) {
       break;
     case 'save-hd': {
       $('#modal-status').textContent = '选择保存位置后将在本机处理…';
-      const hd = await invoke('export', 'hd', current);
-      if (hd) { close(); notify('已保存高清 MP4 · ' + hd.width + ' × ' + hd.height); }
-      else if (dialog.open && $('#modal-status')) $('#modal-status').textContent = '';
+      const off = window.studio.onHdProgress ? window.studio.onHdProgress(pct => {
+        if (dialog.open && $('#modal-status')) $('#modal-status').textContent = '本地转高清处理中 ' + pct + '%…';
+      }) : null;
+      try {
+        const hd = await invoke('export', 'hd', current);
+        if (hd) { close(); notify('已保存高清 MP4 · ' + hd.width + ' × ' + hd.height); }
+        else if (dialog.open && $('#modal-status')) $('#modal-status').textContent = '';
+      } finally { if (off) off(); }
       break;
     }
     case 'save-clip':

@@ -4,17 +4,28 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
 
-function run(ffmpeg, args, cwd) {
+function run(ffmpeg, args, cwd, onStdout) {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpeg, ['-hide_banner', '-nostdin', ...args], { cwd, windowsHide: true });
     let output = '';
     child.stderr.on('data', chunk => { output = (output + chunk).slice(-24000); });
+    if (onStdout) child.stdout.on('data', chunk => onStdout(chunk.toString()));
     child.on('error', () => reject(Error('无法运行内置 FFmpeg。')));
     child.on('close', code => resolve({ code, output }));
   });
 }
-async function encode(ffmpeg, args, work, step) {
-  const { code, output } = await run(ffmpeg, ['-loglevel', 'warning', '-y', ...args], work);
+async function encode(ffmpeg, args, work, step, progress) {
+  const finalArgs = progress ? ['-progress', 'pipe:1', ...args] : args;
+  let buffer = '';
+  const { code, output } = await run(ffmpeg, ['-loglevel', 'warning', '-y', ...finalArgs], work, progress ? chunk => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop();
+    for (const line of lines) {
+      const match = /^out_time_ms=(\d+)$/.exec(line.trim());
+      if (match && progress.total > 0) progress.onProgress(Math.min(1, Number(match[1]) / 1000000 / progress.total));
+    }
+  } : undefined);
   if (code) {
     const detail = output.trim().split(/\r?\n/).slice(-3).join('\n');
     throw Error(step + '失败' + (detail ? '：' + detail : '。退出码 ' + code));
@@ -194,7 +205,7 @@ async function assemble({ ffmpeg, output, clips, settings, music, onStage = () =
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
   }
 }
-async function upscaleEpisode(ffmpeg, source, output) {
+async function upscaleEpisode(ffmpeg, source, output, onProgress) {
   const work = path.dirname(output);
   if (path.resolve(source).toLowerCase() === path.resolve(output).toLowerCase()) throw Error('请选择不同的输出文件。');
   const input = await probe(ffmpeg, source, work);
@@ -208,7 +219,8 @@ async function upscaleEpisode(ffmpeg, source, output) {
     await encode(ffmpeg, ['-i', source, '-map', '0:v:0', '-map', '0:a?', '-vf',
       'scale=' + width + ':' + height + ':flags=lanczos:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1',
       '-c:v', 'libx264', '-threads', '4', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
-      '-c:a', 'copy', '-movflags', '+faststart', temp], work, '本地高清导出');
+      '-c:a', 'copy', '-movflags', '+faststart', temp], work, '本地高清导出',
+      onProgress ? { total: input.duration, onProgress } : undefined);
     const meta = await probe(ffmpeg, temp, work);
     if (!meta.width || !meta.height || !meta.duration) throw Error('高清文件无法读取。');
     await fs.rename(temp, output);

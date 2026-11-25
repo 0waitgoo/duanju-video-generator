@@ -348,3 +348,44 @@ test('参考图超 9 张时按优先级取前 9 张并报出未提交的', () =>
   assert.deepEqual(refs.dropped, ['images/p1.webp', 'images/p2.webp']);
   assert.equal(refs.files[0], 'images/g.webp');
 });
+
+test('模型列表按 Key 自动获取：只留可用于 V2 生成的视频模型，空列表回退内置', async t => {
+  const realFetch = global.fetch;
+  t.after(() => { global.fetch = realFetch; });
+  global.fetch = async url => ({
+    ok: true, status: 200,
+    json: async () => url.includes('deepseek')
+      ? { data: [{ id: 'deepseek-chat' }, { id: 'deepseek-reasoner' }, { id: 'deepseek-v3.2' }] }
+      : { data: [{ id: 'MiniMax-M3' }, { id: 'MiniMax-H3' }, { id: 'MiniMax-H3-Max' }, { id: 'MiniMax-H3-Image' }, { id: 'MiniMax-Hailuo-02' }, { id: 'image-01' }] },
+  });
+  assert.deepEqual(await provider.listMiniMaxModels('https://api.minimax.io', 'k'), ['MiniMax-H3', 'MiniMax-H3-Max']);
+  assert.deepEqual(await provider.listDeepSeekModels('k'), ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v3.2']);
+  global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) });
+  assert.deepEqual(await provider.listMiniMaxModels('https://api.minimax.io', 'k'), ['MiniMax-H3', 'MiniMax-H3-Max']);
+  assert.deepEqual(await provider.listDeepSeekModels('k'), ['deepseek-chat', 'deepseek-reasoner']);
+  global.fetch = async () => { throw Error('offline'); };
+  await assert.rejects(provider.listMiniMaxModels('https://api.minimax.io', 'k'), /网络/);
+});
+
+test('刷新模型保留已选模型，提交指纹包含模型，旧版可清理', { skip: !fixtures }, async t => {
+  const root = await temp(t);
+  const mock = { ...provider,
+    listMiniMaxModels: async () => ['MiniMax-H3', 'MiniMax-H3-Max'],
+    listDeepSeekModels: async () => ['deepseek-chat', 'deepseek-reasoner'] };
+  const work = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg, provider: mock });
+  work.setSettings({ mini: 'fake-mini-secret', deep: 'fake-deep-secret' });
+  assert.deepEqual((await work.refreshModels('mini')).models, ['MiniMax-H3', 'MiniMax-H3-Max']);
+  assert.equal(work.settings().miniModel, 'MiniMax-H3');
+  work.setSettings({ miniModel: 'MiniMax-H3-Max' });
+  assert.equal(work.settings().miniModel, 'MiniMax-H3-Max');
+  assert.deepEqual((await work.refreshModels('deep')).models, ['deepseek-chat', 'deepseek-reasoner']);
+  assert.equal((await work.refreshModels('mini')).model, 'MiniMax-H3-Max');
+  const { id } = await work.import(fixture);
+  assert.equal(work.preflight(id).settings.model, 'MiniMax-H3-Max');
+  const replaced = await work.import(fixture);
+  assert.equal(work.data.projects.length, 2);
+  assert.deepEqual(await work.cleanupOldVersions(replaced.id), { removed: 1 });
+  assert.equal(work.data.projects.length, 1);
+  assert.equal(work.data.projects[0].id, replaced.id);
+  assert.deepEqual(await work.cleanupOldVersions(replaced.id), { removed: 0 });
+});
