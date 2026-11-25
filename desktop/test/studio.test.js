@@ -13,7 +13,7 @@ const ffmpeg = path.join(__dirname, '..', 'build', 'runtime', 'ffmpeg.exe');
 const projectIO = require('../src/project');
 const provider = require('../src/providers');
 const { Workspace } = require('../src/workspace');
-const { probe, subtitleFile, upscaleEpisode } = require('../src/render');
+const { probe, subtitleFile, upscaleVideo } = require('../src/render');
 const run = promisify(execFile);
 const fixture = path.join(fixtures || '', '示例包', 'test-package.zip');
 test('本地高清导出保留音轨、时长与竖屏比例', async t => {
@@ -22,10 +22,10 @@ test('本地高清导出保留音轨、时长与竖屏比例', async t => {
   const dest = path.join(root, '高清.mp4');
   await run(ffmpeg, ['-loglevel', 'error', '-f', 'lavfi', '-i', 'color=red:s=180x320:r=24',
     '-f', 'lavfi', '-i', 'sine=f=440', '-t', '0.5', '-c:v', 'libx264', '-c:a', 'aac', source]);
-  const result = await upscaleEpisode(ffmpeg, source, dest);
+  const result = await upscaleVideo(ffmpeg, source, dest);
   assert.deepEqual([result.width, result.height, result.audio], [1080, 1920, true]);
   assert.ok(Math.abs(result.duration - (await probe(ffmpeg, source, root)).duration) < 0.05);
-  await assert.rejects(upscaleEpisode(ffmpeg, source, source), /不同的输出文件/);
+  await assert.rejects(upscaleVideo(ffmpeg, source, source), /不同的输出文件/);
 });
 const cryptoDouble = {
   isEncryptionAvailable: () => true,
@@ -38,6 +38,41 @@ async function temp(t) {
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   return root;
 }
+test('已采用的高清片段在重启后用于预览、生成检查与拼接，原版可单独打开', { skip: !fixtures }, async t => {
+  const root = await temp(t);
+  let assembledFile;
+  const options = { root, secureStorage: cryptoDouble, ffmpeg, assembler: async ({ clips }) => {
+    assembledFile = clips[0].file;
+    return { width: 1080, height: 1920 };
+  } };
+  let work = new Workspace(options);
+  const { id } = await work.import(fixture);
+  const project = work.project(id);
+  work.setSettings({ mini: 'fake-mini' });
+  work.tick = () => {};
+  work.queue(id, 1, '1-1');
+  const job = project.jobs['1-1'];
+  const dir = path.join(work.downloads, id);
+  await fs.mkdir(dir, { recursive: true });
+  const original = path.join(dir, 'original.mp4');
+  const hd = path.join(root, 'hd.mp4');
+  await run(ffmpeg, ['-loglevel', 'error', '-f', 'lavfi', '-i', 'color=red:s=180x320:r=24',
+    '-t', '0.5', '-c:v', 'libx264', original]);
+  await upscaleVideo(ffmpeg, original, hd);
+  Object.assign(job, { file: 'original.mp4', status: 'done' });
+  await work.adoptHD(id, '1-1', hd, 'ffmpeg', job.localId);
+  await fs.unlink(hd);
+  work = new Workspace(options);
+  assert.equal(work.pathFor('clip', id, '1-1:original'), original);
+  const selected = work.pathFor('clip', id, '1-1');
+  assert.notEqual(selected, original);
+  assert.equal(work.preflight(id).reusedClips[0].hd.width, 1080);
+  await work.render(work.project(id), work.plans(project, 1).slice(0, 1));
+  assert.equal(assembledFile, selected);
+  await fs.unlink(selected);
+  assert.equal(work.pathFor('clip', id, '1-1'), original);
+  assert.equal(work.preflight(id).reusedClips[0].hd, null);
+});
 async function until(work, check) {
   for (let i = 0; i < 350; i++) {
     work.tick();
@@ -86,10 +121,23 @@ test('真实交接 ZIP：2 段 8 镜、逐字提示词、稳定格位与按需�
   assert.equal(body.model, 'MiniMax-H3');
   assert.equal(body.duration, 10);
   assert.equal(body.ratio, '9:16');
-  assert.ok(body.content[1].image_url.startsWith('data:image/png;base64,'));
+  assert.deepEqual(Object.keys(body.content[1].image_url), ['url']);
+  assert.match(body.content[1].image_url.url, /^data:image\/png;base64,/);
   assert.equal(body.content[1].role, 'reference_image');
   assert.ok(!JSON.stringify(body).includes('first_frame'));
   await assert.rejects(provider.prepare({}, second, Array(10).fill('unused'), 10), /1–9/);
+});
+
+test('MiniMax 创建失败保留参数错误码和请求 ID', async t => {
+  const realFetch = global.fetch;
+  t.after(() => { global.fetch = realFetch; });
+  const requestId = '021785229015510a2c883cf675b9804d';
+  global.fetch = async () => ({
+    ok: false, status: 400,
+    json: async () => ({ request_id: requestId, error: { message: 'invalid params (2013)' } }),
+  });
+  await assert.rejects(provider.create({ base: 'https://api.minimax.cn' }, 'fake-key', '{}'), error =>
+    error.code === '2013' && error.requestId === requestId && !error.ambiguous);
 });
 
 test('真实交接分镜：逐列比对全部 50 镜，计算场次与人物绑定', {
@@ -171,6 +219,96 @@ test('独立子段、480P 小样与分镜编辑互不覆盖', { skip: !fixtures 
   assert.deepEqual(Object.keys(project.jobs), ['sample-1-2', '1-2']);
   assert.equal(project.jobs['1-2'].settings.resolution, '768P');
   assert.equal(project.autoAssemble, false);
+  const settings = work.setSettings({ resolution: '480P' });
+  assert.deepEqual(settings.miniVideoOptions[settings.base]['MiniMax-H3'].resolutions, ['480P', '768P', '2K']);
+  assert.deepEqual(settings.miniVideoOptions[settings.base]['MiniMax-H3-Max'].resolutions, ['480P', '768P']);
+  assert.deepEqual(provider.miniResolutions('MiniMax-H3-MG'), ['768P', '2K']);
+  assert.equal(work.queue(id, 2, '2-1'), 1);
+  const formal = project.jobs['2-1'];
+  assert.equal(formal.settings.resolution, '480P');
+  const formalBody = JSON.parse(await provider.prepare(formal.settings, formal.prompt,
+    formal.refs.map(ref => path.join(work.projectsDir, id, ref)), formal.duration));
+  assert.equal(formalBody.resolution, '480P');
+});
+
+test('DeepSeek 诊断只应用勾选项，拒绝过期结果并保留原台词', { skip: !fixtures }, async t => {
+  const root = await temp(t);
+  const mock = { ...provider, diagnose: async (_key, context, images, model) => {
+    assert.equal(context.segment, 1);
+    assert.equal(images.length, 0);
+    assert.equal(model, 'deepseek-v4-pro');
+    return { summary: '测试建议', proposals: [
+      { kind: 'shot', reason: '镜头静音', shot: 1, sfx: '无音效', visual: '不允许修改的画面', dialogue: '禁止改写' },
+      { kind: 'shot', reason: '越界镜头', shot: 9, sfx: '无音效' },
+      { kind: 'shot', reason: '镜头静音', shot: 2, sfx: '无音效' },
+    ] };
+  } };
+  const work = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg, provider: mock });
+  work.setSettings({ deep: 'fake-deep', deepModel: 'deepseek-v4-pro' });
+  const { id } = await work.import(fixture);
+  const project = work.project(id);
+  const [shot, second] = project.segments[0].shots;
+  const original = { ...shot };
+  await assert.rejects(work.diagnose(id, 1, true), /支持看图/);
+  await assert.rejects(work.diagnose(id, 1, false, 'unknown-model'), /选择模型/);
+  const draft = await work.diagnose(id, 1, false);
+  assert.equal(draft.model, 'deepseek-v4-pro');
+  assert.equal(draft.proposals.length, 2);
+  assert.deepEqual(draft.proposals[0].changes.map(change => change.field), ['sfx']);
+  work.applyDiagnosis(id, draft.token, [0]);
+  assert.equal(shot.sfx, '无音效');
+  assert.equal(second.sfx, '');
+  assert.equal(shot.visual, original.visual);
+  assert.deepEqual(shot.dialogue, original.dialogue);
+  assert.throws(() => work.applyDiagnosis(id, draft.token, [1]), /已失效/);
+  const next = await work.diagnose(id, 1, false);
+  work.editShot(id, 1, 2, { ...second, visual: '新动作' });
+  assert.throws(() => work.applyDiagnosis(id, next.token, [0]), /已变化/);
+});
+
+test('本地换图更新后续任务，旧引用可读并可恢复原图', { skip: !fixtures }, async t => {
+  const root = await temp(t);
+  const work = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg });
+  const { id } = await work.import(fixture);
+  const project = work.project(id);
+  const segment = project.segments[0], part = projectIO.plan(segment)[0];
+  const item = project.characters.find(actor => actor.name === '小雅');
+  const original = item.image;
+  const before = work.makeJob(project, segment, part, work.settings());
+  const replacement = path.join(root, '新定妆照.png');
+  await run(ffmpeg, ['-loglevel', 'error', '-f', 'lavfi', '-i', 'color=red:s=256x256', '-frames:v', '1', '-threads', '1', replacement]);
+  await work.replaceArt(id, 'characters', item.id, replacement);
+  assert.notEqual(item.image, original);
+  const updated = work.makeJob(project, segment, part, work.settings());
+  assert.ok(updated.refs.includes(path.normalize(item.image)));
+  assert.ok(before.refs.includes(path.normalize(original)));
+  await fs.access(work.pathFor('image', id, original));
+  await work.replaceArt(id, 'characters', item.id, null);
+  assert.equal(item.image, original);
+  assert.deepEqual(work.makeJob(project, segment, part, work.settings()).refs, before.refs);
+});
+
+test('手动绑定影响拆分后的提交，清空保持为空，恢复后回到自动推导', { skip: !fixtures }, async t => {
+  const root = await temp(t);
+  const work = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg });
+  const { id } = await work.import(fixture);
+  const project = work.project(id);
+  const segment = project.segments[0];
+  const part = projectIO.plan(segment)[1];
+  const refs = () => projectIO.referenceFiles(project, segment, part).files;
+  const original = refs();
+  const actor = project.characters.find(item => !original.includes(item.image));
+  const dialogue = structuredClone(part.shots.at(-1).dialogue);
+  assert.ok(actor);
+  work.editBindings(id, 1, { characters: [actor.id], scenes: [], props: [] });
+  assert.deepEqual(refs(), [segment.gridImage, actor.image]);
+  assert.ok(projectIO.prompt(project, segment, part).includes('人物参考：' + actor.name));
+  assert.deepEqual(part.shots.at(-1).dialogue, dialogue);
+  const restarted = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg });
+  assert.equal(restarted.snapshot().projects[0].segments[0].bindings.characters[0].id, actor.id);
+  assert.throws(() => work.editBindings(id, 1, { props: [actor.id] }), /不在该分类/);
+  work.editBindings(id, 1, null);
+  assert.deepEqual(refs(), original);
 });
 
 test('重做保留旧片，主动选择新片，同一输入才复用', { skip: !fixtures }, async t => {
@@ -218,6 +356,8 @@ test('重启恢复远端任务，单独重试过期段并自动导出真实本�
   const music = path.join(root,'test-music.wav');
   await run(ffmpeg, ['-hide_banner','-loglevel','error','-y','-f','lavfi','-i','sine=f=330:d=2',music]);
   const submits = [];
+  const phases = [];
+  let work;
   const mock = {
     ...provider, create: async (_settings, _key, body) => {
       const request = JSON.parse(body);
@@ -228,11 +368,19 @@ test('重启恢复远端任务，单独重试过期段并自动导出真实本�
     },
     query: async (_base, _key, id) => {
       if (id === '1-2-1') throw Object.assign(Error('任务已过期'), { code: 2013 });
+      if (id === '1-1-1') {
+        phases.push(work.snapshot().projects[0].jobs['1-1'].remoteState);
+        if (phases.length === 1) return { state: 'queued' };
+        if (phases.length === 2) return { state: 'running' };
+      }
       return { state: 'succeeded', url: id.startsWith('1-1') ? 'blue' : id.startsWith('1-2') ? 'green' : 'red' };
     },
-    download: async (color, output) => fs.copyFile(clips[color], output),
+    download: async (color, output) => {
+      if (color === 'blue') phases.push(work.snapshot().projects[0].jobs['1-1'].remoteState);
+      await fs.copyFile(clips[color], output);
+    },
   };
-  let work = new Workspace({ root: path.join(root, 'data'), secureStorage: cryptoDouble, ffmpeg, provider: mock, pollMs: 100000 });
+  work = new Workspace({ root: path.join(root, 'data'), secureStorage: cryptoDouble, ffmpeg, provider: mock, pollMs: 100000 });
   const { id } = await work.import(fixture);
   const project = work.project(id);
   project.segments[0].shots[0].sfx = '脚步声';
@@ -247,6 +395,7 @@ test('重启恢复远端任务，单独重试过期段并自动导出真实本�
   for (const job of Object.values(restored.jobs)) job.nextAt = 0;
   await until(work, () => restored.jobs['1-2'].status === 'failed' &&
     restored.jobs['1-1'].status === 'done' && restored.jobs['2-1'].status === 'done');
+  assert.deepEqual(phases, [null, 'queued', 'running', 'downloading']);
   assert.equal(restored.jobs['1-2'].error.code, 2013);
   work.retry(id, '1-2');
   await until(work, () => ['done','error'].includes(restored.episode.status));
@@ -349,32 +498,47 @@ test('参考图超 9 张时按优先级取前 9 张并报出未提交的', () =>
   assert.equal(refs.files[0], 'images/g.webp');
 });
 
-test('模型列表按 Key 自动获取：只留可用于 V2 生成的视频模型，空列表回退内置', async t => {
+test('MiniMax 按站点显示官方视频 V2 模型，DeepSeek 按 Key 拉取模型', async t => {
   const realFetch = global.fetch;
   t.after(() => { global.fetch = realFetch; });
-  global.fetch = async url => ({
-    ok: true, status: 200,
-    json: async () => url.includes('deepseek')
-      ? { data: [{ id: 'deepseek-chat' }, { id: 'deepseek-reasoner' }, { id: 'deepseek-v3.2' }] }
-      : { data: [{ id: 'MiniMax-M3' }, { id: 'MiniMax-H3' }, { id: 'MiniMax-H3-Max' }, { id: 'MiniMax-H3-Image' }, { id: 'MiniMax-Hailuo-02' }, { id: 'image-01' }] },
-  });
-  assert.deepEqual(await provider.listMiniMaxModels('https://api.minimax.io', 'k'), ['MiniMax-H3', 'MiniMax-H3-Max']);
+  const root = await temp(t);
+  const work = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg });
+  const mainland = 'https://api.minimax.cn';
+  const international = 'https://api.minimax.io';
+  const models = ['MiniMax-H3', 'MiniMax-H3-Highspeed', 'MiniMax-H3-Lite', 'MiniMax-H3-Max'];
+  work.data.settings = { ...work.data.settings, base: mainland, miniModels: ['MiniMax-H3', 'MiniMax-H3-Max'], resolution: '480P' };
+  global.fetch = async () => assert.fail('MiniMax 视频清单不应调用其他模型接口');
+  assert.deepEqual((await work.refreshModels('mini')).models, models);
+  assert.equal(work.settings().resolution, '768P');
+  assert.deepEqual(work.setSettings({ base: international }).miniModels, [...models, 'MiniMax-H3-Max-Turbo', 'MiniMax-H3-MG', 'MiniMax-H3-NC']);
+  const lite = work.setSettings({ base: mainland, miniModel: 'MiniMax-H3-Lite', resolution: '480P', ratio: 'adaptive' });
+  assert.equal(lite.miniModel, 'MiniMax-H3-Lite');
+  assert.equal(lite.resolution, '480P');
+  assert.equal(lite.ratio, '9:16');
+  assert.deepEqual(lite.miniVideoOptions[mainland]['MiniMax-H3-Lite'], { resolutions: ['480P', '768P'], adaptive: false });
+  const liteOpts = { base: mainland, miniModel: lite.miniModel, resolution: '480P', ratio: '9:16' };
+  assert.doesNotThrow(() => provider.validateMiniVideoOptions(liteOpts, 4));
+  assert.throws(() => provider.validateMiniVideoOptions({ ...liteOpts, ratio: 'adaptive' }, 4), /指定画幅/);
+  assert.throws(() => provider.validateMiniVideoOptions({ ...liteOpts, miniModel: 'MiniMax-H3' }, 4), /不支持 480P/);
+  assert.throws(() => provider.validateMiniVideoOptions({ ...liteOpts, miniModel: 'MiniMax-H3-Max' }, 4), /5–15/);
+  global.fetch = async url => {
+    assert.equal(url, 'https://api.deepseek.com/models');
+    return { ok: true, status: 200, json: async () => ({ data: [{ id: 'deepseek-chat' }, { id: 'deepseek-reasoner' }, { id: 'deepseek-v3.2' }] }) };
+  };
   assert.deepEqual(await provider.listDeepSeekModels('k'), ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v3.2']);
   global.fetch = async () => ({ ok: true, status: 200, json: async () => ({ data: [] }) });
-  assert.deepEqual(await provider.listMiniMaxModels('https://api.minimax.io', 'k'), ['MiniMax-H3', 'MiniMax-H3-Max']);
-  assert.deepEqual(await provider.listDeepSeekModels('k'), ['deepseek-chat', 'deepseek-reasoner']);
+  assert.deepEqual(await provider.listDeepSeekModels('k'), ['deepseek-flash', 'deepseek-v4-pro']);
   global.fetch = async () => { throw Error('offline'); };
-  await assert.rejects(provider.listMiniMaxModels('https://api.minimax.io', 'k'), /网络/);
+  await assert.rejects(provider.listDeepSeekModels('k'), /网络/);
 });
 
 test('刷新模型保留已选模型，提交指纹包含模型，旧版可清理', { skip: !fixtures }, async t => {
   const root = await temp(t);
   const mock = { ...provider,
-    listMiniMaxModels: async () => ['MiniMax-H3', 'MiniMax-H3-Max'],
     listDeepSeekModels: async () => ['deepseek-chat', 'deepseek-reasoner'] };
   const work = new Workspace({ root, secureStorage: cryptoDouble, ffmpeg, provider: mock });
   work.setSettings({ mini: 'fake-mini-secret', deep: 'fake-deep-secret' });
-  assert.deepEqual((await work.refreshModels('mini')).models, ['MiniMax-H3', 'MiniMax-H3-Max']);
+  assert.ok((await work.refreshModels('mini')).models.includes('MiniMax-H3-Lite'));
   assert.equal(work.settings().miniModel, 'MiniMax-H3');
   work.setSettings({ miniModel: 'MiniMax-H3-Max' });
   assert.equal(work.settings().miniModel, 'MiniMax-H3-Max');
