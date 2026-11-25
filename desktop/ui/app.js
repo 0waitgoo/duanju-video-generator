@@ -6,19 +6,7 @@ const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 })[char]);
 const E = escapeHtml;
-const labels = { queued: '本地排队', submitting: '提交给 MiniMax', remote: '云端已接收', done: '已完成', failed: '失败', uncertain: '需核对提交' };
-const remoteLabels = { queued: '云端排队', pending: '云端排队', running: '云端生成中', processing: '云端生成中', downloading: '下载到本机' };
-const isActive = job => ['queued', 'submitting', 'remote'].includes(job?.status);
-function jobStatus(job) {
-  if (!job) return '未提交';
-  if (job.status === 'queued' && state.hold) return '已暂停';
-  if (job.preparing) return '本地准备素材';
-  if (job.status === 'remote' && job.error?.code === 'NETWORK') return '等待重新连接';
-  return (job.status === 'remote' && remoteLabels[job.remoteState]) || labels[job.status] || job.status;
-}
-function statusLabel(value, active) {
-  return '<span class="job-status' + (active ? ' job-status-active' : '') + '">' + E(value) + '</span>';
-}
+const labels = { queued: '排队中', submitting: '正在提交', remote: '生成中', done: '已完成', failed: '失败', uncertain: '需核对提交' };
 const encode = value => encodeURIComponent(value).replace(/[!'()*]/g, char => '%' + char.charCodeAt(0).toString(16));
 const url = (kind, id, item = '') => 'studio://' + kind + '/' + encode(id) + '/' + encode(item);
 const seconds = value => Number(value.toFixed(2)) + ' 秒';
@@ -27,7 +15,6 @@ const measure = shots => shots.reduce((sum, shot) => sum + shot.durationSec, 0);
 let state = { projects: [], settings: {} };
 let current = '';
 let selection = 1;
-let timelineFocus = false;
 let openModal = '';
 let signature = '';
 let refreshing = false;
@@ -65,12 +52,8 @@ function renderProjects() {
   if ($('#projects').innerHTML !== markup) $('#projects').innerHTML = markup;
 }
 function segmentTile(p, seg, active) {
-  const jobs = seg.parts.map(part => p.jobs[part.id]);
-  const states = jobs.map(job => job?.status);
-  const generating = jobs.find(isActive);
-  const sampling = seg.parts.map(part => p.jobs['sample-' + part.id]).find(isActive);
-  const status = seg.problem ? '需调整时长' : states.length && states.every(item => item === 'done') ? '已完成' :
-    generating ? jobStatus(generating) :
+  const states = seg.parts.map(part => p.jobs[part.id]?.status);
+  const status = seg.problem ? '需调整时长' : states.every(item => item === 'done') ? '已完成' :
     states.some(item => ['failed', 'uncertain'].includes(item)) ? '需要处理' :
     states.some(Boolean) ? '生成队列中' : '未生成';
   const image = p.images[seg.gridImage] ? 'background-image:url(' + url('image', p.id, seg.gridImage) + ');' : '';
@@ -81,8 +64,7 @@ function segmentTile(p, seg, active) {
     '" title="第 ' + shot.shotIndex + ' 镜 · ' + E(shot.framing) + ' · ' + E(seconds(shot.durationSec)) + '"')).join('');
   return '<article class="segment ' + (active === seg.index ? 'selected' : '') + '" data-segment="' + seg.index + '"><header class="seg-head"><b>第 ' +
     seg.index + ' 段</b><span class="mono">' + E(seconds(measure(seg.shots))) + '</span></header><div class="tiles">' + tiles +
-    '</div><span class="seg-state">' + statusLabel(status, Boolean(generating) && !state.hold) +
-    (sampling ? statusLabel('小样 · ' + jobStatus(sampling), !state.hold) : '') + '</span></article>';
+    '</div><span class="seg-state">' + status + '</span></article>';
 }
 function tags(p, items) {
   return items.map(item => '<span class="tag" title="' + E(item.description) + '">' +
@@ -92,37 +74,32 @@ function inspector(p, seg, shot) {
   if (!shot) return '';
   const dialogue = shot.dialogue?.text?.trim() ? '<p class="dialogue"><small>台词</small>💬 ' +
     E((shot.dialogue.speaker ? shot.dialogue.speaker + '：' : '') + shot.dialogue.text) + '</p>' : '<p class="muted">无台词</p>';
-  const { characters, assets } = seg.bindings;
-  const groups = [['人物', characters], ['场景', assets.filter(item => item.kind === '场景')],
-    ['道具', assets.filter(item => item.kind !== '场景')]];
-  const bindings = '<section class="inspector-bindings" aria-label="本段绑定资源"><div class="binding-header"><h3>本段绑定资源</h3>' +
-    (seg.bindingOverrides ? '<span class="muted">手动</span>' : '') + button('编辑绑定', 'binding-edit') +
-    button('换图', 'art-library', 'aria-label="替换美术资源图片"') + '</div>' +
-    groups.map(([label, items]) => '<div class="binding-row"><small>' + label + '</small><div class="tags">' +
-      (tags(p, items) || '<span class="muted">未绑定</span>') + '</div></div>').join('') + '</section>';
   return '<aside class="panel inspector"><header class="panel-head"><h2>第 ' + shot.shotIndex +
     ' 镜</h2><div class="panel-tools"><span class="mono muted">' + E(seconds(shot.durationSec)) + '</span>' +
-    button('编辑分镜', 'shot-edit') + '</div></header>' + bindings + '<div class="inspect-body">' +
+    button('编辑分镜', 'shot-edit') + '</div></header><div class="inspect-body">' +
     '<p><small>画面 · ' + E(shot.framing) + '</small>' + E(shot.visual || '—') + '</p>' +
     '<p><small>分镜提示词</small>' + E(shot.prompt || '—') + '</p>' + dialogue +
     '<p><small>运镜</small>' + E(shot.camera || '—') + '</p><p><small>音效</small>' + E(shot.sfx || '—') + '</p>' +
+    (shot.director ? '<p><small>导演</small>' + E([shot.director.event, shot.director.focus, shot.director.viewpoint, shot.director.eyeline, shot.director.pressure].filter(Boolean).join('；') || '—') + '</p>' : '') +
+    (shot.state ? '<p><small>本镜状态</small>' + E(shot.state) + '</p>' : '') +
+    (shot.acceptance ? '<p><small>画布验收</small>' + E(shot.acceptance.status === 'pass' ? '通过' : shot.acceptance.status === 'fail' ? '未通过' + (shot.acceptance.failed.length ? '：' + shot.acceptance.failed.join('、') : '') : '未检查') + '</p>' : '') +
+    '<small>本段人物锁</small><div class="tags">' + (tags(p, seg.bindings.characters) || '—') + '</div>' +
+    '<small>本段场景与道具</small><div class="tags">' + (tags(p, seg.bindings.assets) || '—') + '</div>' +
     (seg.gridPrompt ? '<p><small>四宫格总提示词</small>' + E(seg.gridPrompt) + '</p>' : '') + '</div></aside>';
 }
 function queuePanel(p, allParts) {
   const rows = allParts.map(part => {
     const job = p.jobs[part.id];
     const stateClass = ['failed', 'uncertain'].includes(job?.status) ? 'red' : job?.status === 'done' ? 'green' : 'muted';
-    const status = statusLabel(jobStatus(job), isActive(job) && !state.hold);
+    const status = labels[job?.status] || '未提交';
     const data = 'data-part="' + part.id + '"';
     const sampleId = 'sample-' + part.id;
     const sample = p.jobs[sampleId];
     const sampleData = 'data-part="' + sampleId + '"';
     const sampleActions = !sample ? button('480P 小样', 'sample-check', data) :
-      sample.status === 'done' ? button('看小样', 'clip', sampleData) + button('小样转高清', 'hd-check', sampleData) +
-        button('再做小样', 'sample-check', data) :
+      sample.status === 'done' ? button('看小样', 'clip', sampleData) + button('再做小样', 'sample-check', data) :
       ['failed', 'uncertain'].includes(sample.status) ? button('处理小样', 'retry', sampleData) : '';
-    const controls = (job?.usable ? button(job.activeHD ? '预览高清' : '预览', 'clip', data) : '') +
-      (job?.usable && job.versions?.length ? button('版本对比', 'versions', data) : '') +
+    const controls = (job?.usable ? button(job.versions?.length ? '版本对比' : '预览', job.versions?.length ? 'versions' : 'clip', data) : '') +
       (!job ? button('生成子段', 'part-check', data) : '') +
       (job?.status === 'done' ? button('重做', 'redo-check', data) : '') +
       (['failed', 'uncertain'].includes(job?.status) ? button(job.status === 'uncertain' ? '核对' : '重试', 'retry', data) : '');
@@ -130,15 +107,10 @@ function queuePanel(p, allParts) {
       (job?.reused ? ' · 已复用' : '') + (job ? ' · ' + job.settings.resolution + (job.attempts.length ? ' · 已提交 ' + job.attempts.length + ' 次' : '') : '');
     return '<div class="queue-row"><div><b>子段 ' + part.id + '</b><div class="' + stateClass + '">' + status +
       '</div></div><div class="detail muted">' + E(detail) +
-      (job?.activeHD ? '<div class="green">已采用高清 · ' + E(job.activeHD.width + ' × ' + job.activeHD.height) + '</div>' : '') +
       (job?.error ? '<div class="red">' + E(job.error.message + (job.error.code ? '（' + job.error.code + '）' : '')) + '</div>' : '') +
       (job && job.prompt !== part.prompt ? '<div class="yellow">分镜提示已更新，可重做应用到新视频。</div>' : '') +
-      (job?.refs && part.refs && JSON.stringify(job.refs) !== JSON.stringify(part.refs) ?
-        '<div class="yellow">参考素材已更新，可重做应用到新视频。</div>' : '') +
-      (sample ? '<div class="sample-status">480P 小样 · ' + statusLabel(jobStatus(sample), isActive(sample) && !state.hold) +
-        (sample.activeHD ? ' · 已采用高清' : '') +
-        (sample.attempts?.length ? ' · 提交 ' + sample.attempts.length + ' 次' : '') +
-        (sample.error ? ' · ' + E(sample.error.message + (sample.error.code ? '（' + sample.error.code + '）' : '')) : '') + '</div>' : '') +
+      (sample ? '<div>480P 小样 · ' + E(labels[sample.status] || sample.status) +
+        (sample.error ? ' · ' + E(sample.error.message) : '') + '</div>' : '') +
       '</div><div class="controls">' + controls + sampleActions + '</div></div>';
   }).join('');
   const done = allParts.filter(part => p.jobs[part.id]?.usable).length;
@@ -170,7 +142,7 @@ function resultPanel(p, allParts) {
 function render() {
   renderProjects();
   const p = project();
-  const key = JSON.stringify([p, selection, timelineFocus, state.hold, state.queueError, state.settings.resolution]);
+  const key = JSON.stringify([p, selection, state.hold, state.queueError, state.settings.resolution]);
   if (signature === key) return;
   signature = key;
   if (!p) {
@@ -184,34 +156,27 @@ function render() {
   const { seg, shot } = pick();
   const allParts = p.segments.flatMap(segment => segment.parts);
   const timelineScroll = $('.timeline')?.scrollLeft || 0;
-  const timelineTop = $('.timeline')?.scrollTop || 0;
   const queueScroll = $('.queue-scroll')?.scrollTop || 0;
   const inspectScroll = $('.inspect-body')?.scrollTop || 0;
   const existingVideo = $('#episode-player');
   const runningText = state.hold || state.queueError;
   const newCount = allParts.filter(part => !p.jobs[part.id]).length;
-  const activeCount = Object.values(p.jobs).filter(isActive).length;
   const generateLabel = p.episode.status === 'done' ? '整集已生成' : '检查并生成整集';
-  work.innerHTML = '<div class="content' + (timelineFocus ? ' timeline-focus' : '') + '"><header class="overview"><div><h1>' + E(p.title) +
+  work.innerHTML = '<div class="content"><header class="overview"><div><h1>' + E(p.title) +
     '</h1><div class="canvas">' + E(p.canvasName) + '</div></div><div class="actions">' +
     button('清理旧版', 'cleanup-versions', 'class="subtle"') + button('删除', 'remove', 'class="subtle"') + button(generateLabel, 'queue-all', 'class="primary" ' + (p.episode.status === 'done' ? 'disabled' : '')) +
     '</div></header><div class="facts"><span><b>' + p.segments.length + '</b>段</span><span><b>' +
     p.segments.reduce((sum, item) => sum + item.shots.length, 0) + '</b>镜</span><span><b>' + E(seconds(measure(p.segments.flatMap(item => item.shots)))) +
     '</b>总长</span><span><b>' + Object.keys(p.images).length + '</b>张图</span><span><b>' + newCount +
-    '</b>个待提交子段</span>' + (activeCount ? '<span role="status">' +
-      statusLabel(activeCount + (state.hold ? ' 个任务待恢复' : ' 个任务处理中'), !state.hold) + '</span>' : '') +
-    '<div class="checks">' + button(loneRed ? loneRed + ' 项问题' : loneYellow ? loneYellow + ' 项提醒' : '一致性通过', 'checks',
+    '</b>个待提交子段</span><div class="checks">' + button(loneRed ? loneRed + ' 项问题' : loneYellow ? loneYellow + ' 项提醒' : '一致性通过', 'checks',
     'class="check-button ' + (loneRed ? 'red' : loneYellow ? 'yellow' : 'green') + '"') + '</div></div>' +
     (runningText ? '<p class="notice">' + E(runningText) + ' ' + button('打开设置', 'settings', 'class="quiet"') + '</p>' : '') +
     '<div class="editing"><section class="panel"><header class="panel-head"><h2>分镜时间线</h2><div class="panel-tools">' +
-    button(timelineFocus ? '退出放大' : '放大编辑', 'timeline-focus', 'aria-pressed="' + timelineFocus + '"') +
     button('提示词工作台', 'prompt') + button('生成本段', 'queue-one') +
     '</div></header><div class="timeline">' + p.segments.map(segment => segmentTile(p, segment, seg.index)).join('') +
-    '</div></section>' + inspector(p, seg, shot) + '</div>' + (timelineFocus ? '' :
-      '<div class="lower">' + queuePanel(p, allParts) + resultPanel(p, allParts) + '</div>') + '</div>';
+    '</div></section>' + inspector(p, seg, shot) + '</div><div class="lower">' + queuePanel(p, allParts) + resultPanel(p, allParts) + '</div></div>';
   $('.timeline').scrollLeft = timelineScroll;
-  $('.timeline').scrollTop = timelineTop;
-  if ($('.queue-scroll')) $('.queue-scroll').scrollTop = queueScroll;
+  $('.queue-scroll').scrollTop = queueScroll;
   if ($('.inspect-body')) $('.inspect-body').scrollTop = inspectScroll;
   if (existingVideo && $('#episode-player')?.src === existingVideo.src) $('#episode-player').replaceWith(existingVideo);
 }
@@ -220,7 +185,6 @@ async function refresh() {
   refreshing = true;
   try {
     state = await invoke('state');
-    $('#app-version').textContent = state.appVersion ? '软件 v' + state.appVersion : '';
     if (!project()) {
       current = state.projects[0]?.id || '';
       selection = 1;
@@ -238,7 +202,7 @@ function close() { if (dialog.open) dialog.close(); openModal = ''; }
 const fieldSelect = (id, title, values, selected) => '<label class="field">' + E(title) + '<select id="' + id + '">' +
   selectOptions(values, selected) + '</select></label>';
 function keyField(id, title, suffix, text) {
-  return '<div class="key-section"><h3>' + E(title) + ' Key <span class="muted" id="' + id + '-key-status">' + (suffix ? ' · ••••' + E(suffix) : ' · 未设置') +
+  return '<div class="key-section"><h3>' + E(title) + ' Key <span class="muted">' + (suffix ? ' · ••••' + E(suffix) : ' · 未设置') +
     '</span></h3><div class="key-line"><input id="' + id + '" type="password" placeholder="填写新 Key" aria-label="' + E(title) +
     ' Key" autocomplete="off"><label><input id="' + id + '-clear" type="checkbox"> 清除</label>' +
     button('测试连接', 'test', 'data-kind="' + id + '"') + '</div><p>' + E(text) + ' ' +
@@ -247,59 +211,31 @@ function keyField(id, title, suffix, text) {
 function settings() {
   const s = state.settings;
   const sets = [keyField('mini', 'MiniMax', s.miniSuffix, 'H3 需要按量付费 Key。'),
-    keyField('deep', 'DeepSeek', s.deepSuffix, '用于提示词优化和一致性分析。')];
+    keyField('deep', 'DeepSeek', s.deepSuffix, '用于提示词优化。')];
   modal('设置', sets.join('') + '<div class="settings-grid">' +
     fieldSelect('site', 'MiniMax 站点', [['https://api.minimax.io','国际站'], ['https://api.minimax.cn','大陆站']], s.base) +
-    fieldSelect('mini-model', 'MiniMax 视频模型', modelOptions(s.miniModels, ''), s.miniModel) +
-    fieldSelect('resolution', '视频分辨率', modelOptions(s.miniVideoOptions[s.base][s.miniModel].resolutions, ''), s.resolution) +
-    fieldSelect('ratio', '画幅', ratioOptions(s.miniVideoOptions[s.base][s.miniModel].adaptive), s.ratio) +
+    fieldSelect('mini-model', 'MiniMax 视频模型', modelOptions(s.miniModels, '先填 Key，再点刷新模型列表'), s.miniModel) +
+    fieldSelect('resolution', '视频分辨率', [['768P','768P'],['2K','2K']], s.resolution) +
+    fieldSelect('ratio', '画幅', [['9:16','9:16 竖屏'],['16:9','16:9 横屏'],['1:1','1:1 方形'],['adaptive','跟随参考图']], s.ratio) +
     fieldSelect('transition', '子段衔接', [['dissolve','短叠化 · 0.2 秒'],['cut','直接切换']], s.transition) +
-    fieldSelect('deep-model', 'DeepSeek 模型', modelOptions(s.deepModels, '保存 Key 后自动获取'), s.deepModel) +
+    fieldSelect('deep-model', 'DeepSeek 优化模型', modelOptions(s.deepModels, '先填 Key，再点刷新模型列表'), s.deepModel) +
     '<label class="field">同时生成子段数<input id="concurrency" type="number" min="1" max="6" value="' + s.concurrency + '"></label></div>' +
-    '<p class="muted">MiniMax 型号按所选站点的官方视频 V2 文档显示，实际生成权限由该站点和 Key 决定。大陆站 480P 小样可用 H3 Lite、Highspeed 或 Max。</p>' +
-    '<p class="muted">打开设置或保存新的 DeepSeek Key 后会拉取 DeepSeek 模型列表。</p>' +
+    '<p class="muted">模型按 Key 自动获取：点「刷新模型列表」拉取该账号可用的模型，再自己选。保存设置后也会自动刷新一次。</p>' +
     '<label class="switch"><input id="h3-audio" type="checkbox" ' + (s.generateAudio ? 'checked' : '') + '> 保留 MiniMax 原生声音</label>' +
     '<label class="switch"><input id="fx" type="checkbox" ' + (s.effects ? 'checked' : '') + '> 自动混入分镜音效</label>',
-    (state.hold ? button('恢复队列', 'resume') : '') + button('保存并刷新 DeepSeek 模型', 'refresh-models') +
+    (state.hold ? button('恢复队列', 'resume') : '') + button('刷新模型列表', 'refresh-models') +
     button('保存设置', 'save-settings', 'class="primary"'), 'settings');
-  $('#site').addEventListener('change', syncMiniVideoOptions);
-  $('#mini-model').addEventListener('change', syncMiniVideoOptions);
 }
 const modelOptions = (models, emptyLabel) => (models && models.length ? models.map(m => [m, m]) : [['', emptyLabel]]);
-const ratioOptions = adaptive => [
-  ['9:16', '9:16 竖屏'], ['16:9', '16:9 横屏'], ['1:1', '1:1 方形'],
-  ...(adaptive ? [['adaptive', '跟随参考图']] : []),
-];
-function syncMiniVideoOptions() {
-  const options = state.settings.miniVideoOptions[$('#site').value];
-  const model = $('#mini-model');
-  const selected = Object.hasOwn(options, model.value) ? model.value : 'MiniMax-H3';
-  model.innerHTML = selectOptions(modelOptions(Object.keys(options), ''), selected);
-  const { resolutions, adaptive } = options[selected];
-  const resolution = $('#resolution');
-  resolution.innerHTML = selectOptions(modelOptions(resolutions, ''), resolutions.includes(resolution.value) ? resolution.value : '768P');
-  const ratio = $('#ratio');
-  ratio.innerHTML = selectOptions(ratioOptions(adaptive), !adaptive && ratio.value === 'adaptive' ? '9:16' : ratio.value);
-}
-async function refreshModelLists(kinds = ['deep']) {
-  const status = $('#modal-status');
+async function refreshModelLists() {
   const notes = [];
-  if (status && openModal === 'settings') status.textContent = '正在获取模型列表…';
-  for (const kind of kinds) {
+  for (const kind of ['mini', 'deep']) {
     if (!state.settings[kind + 'Suffix']) continue;
     try {
       const result = await invoke('refresh-models', kind);
-      state.settings[kind + 'Models'] = result.models;
-      state.settings[kind + 'Model'] = result.model;
-      const select = $('#' + kind + '-model');
-      if (select && $('#modal-status') === status && openModal === 'settings') {
-        const selected = result.models.includes(select.value) ? select.value : result.model;
-        select.innerHTML = selectOptions(modelOptions(result.models, ''), selected);
-      }
       notes.push((kind === 'mini' ? 'MiniMax' : 'DeepSeek') + ' ' + result.models.length + ' 个模型，当前 ' + result.model);
     } catch (error) { notes.push((kind === 'mini' ? 'MiniMax' : 'DeepSeek') + ' 刷新失败：' + (error.message || error)); }
   }
-  if (status && $('#modal-status') === status && openModal === 'settings') status.textContent = notes.join('；') || '请先填写 Key。';
   return notes;
 }
 function settingsInput() {
@@ -311,18 +247,12 @@ function settingsInput() {
   };
 }
 async function saveSettings() {
-  const status = $('#modal-status');
-  state.settings = await invoke('settings', settingsInput());
-  if ($('#modal-status') === status && openModal === 'settings') {
-    $('#mini').value = '';
-    $('#deep').value = '';
-    $('#mini-clear').checked = false;
-    $('#deep-clear').checked = false;
-    for (const kind of ['mini', 'deep']) {
-      const suffix = state.settings[kind + 'Suffix'];
-      $('#' + kind + '-key-status').textContent = suffix ? ' · ••••' + suffix : ' · 未设置';
-    }
-  }
+  await invoke('settings', settingsInput());
+  $('#mini').value = '';
+  $('#deep').value = '';
+  $('#mini-clear').checked = false;
+  $('#deep-clear').checked = false;
+  await refresh();
 }
 function checks() {
   const p = project();
@@ -332,43 +262,7 @@ function checks() {
   'locate', 'class="issue" data-segment="' + item.segment + '" data-shot="' + (item.shot || '') + '"')).join('');
   const missing = p.check.missing.length ? '<details><summary>缺失图片清单</summary><ul>' +
     p.check.missing.map(file => '<li>' + E(file) + '</li>').join('') + '</ul></details>' : '';
-  const segments = [...new Set(issues.map(item => item.segment))];
-  const options = segments.map(n => [String(n), '第 ' + n + ' 段 · ' + issues.filter(item => item.segment === n).length + ' 项']).map(([value, label]) =>
-    '<option value="' + value + '">' + E(label) + '</option>').join('');
-  const vision = model => ['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'].includes(model);
-  const models = (state.settings.deepModels || []).map(model => [model, model + (vision(model) ? ' · 支持看图' : ' · 文字分析')]);
-  const analysis = segments.length ? '<div class="key-section"><label class="field">分析范围<select id="analysis-segment">' + options +
-    '</select></label>' + fieldSelect('analysis-model', '分析模型', models, state.settings.deepModel) +
-    '<label class="switch"><input type="checkbox" id="analysis-images"> 同时分析四宫格和相关定妆照</label>' +
-    '<p class="muted">分析会把所选段的检查项、分镜和人物信息发给 DeepSeek。选用支持看图的模型后可附上图片。</p></div>' : '';
-  modal('一致性检查', analysis + (issue || '<p class="green">全部通过。</p>') + missing,
-    segments.length ? button(state.settings.deepSuffix ? 'DeepSeek 分析' : '设置 DeepSeek Key',
-      state.settings.deepSuffix ? 'diagnose' : 'settings', 'class="primary"') : '', 'checks');
-  if (segments.length) {
-    const model = $('#analysis-model');
-    const images = $('#analysis-images');
-    const sync = () => {
-      images.disabled = !vision(model.value);
-      if (images.disabled) images.checked = false;
-    };
-    model.addEventListener('change', sync);
-    sync();
-  }
-}
-function diagnosisReview(segment, report) {
-  const choices = report.proposals.map((item, index) => '<section class="key-section">' +
-    '<label class="switch"><input type="checkbox" data-proposal="' + index + '"> ' +
-    E(item.kind === 'shot' ? '第 ' + item.shot + ' 镜' : item.kind === 'cast' ? '补充人物绑定' : '标记为无人物段') +
-    '</label><p>' + E(item.reason) + '</p>' + (item.changes ?
-      item.changes.map(change => '<div class="diagnostic-change"><strong>' + E(change.label) +
-        '</strong><div>当前 · ' + E(change.before || '空') + '</div><div>建议 · ' + E(change.after) + '</div></div>').join('') :
-      '<div class="diagnostic-change">建议 · ' + E(item.after) + '</div>') + '</section>').join('');
-  const source = report.hasGrid ? '已分析四宫格 · ' + report.images + ' 张图片' : '未分析四宫格，请结合画面核对';
-  modal('第 ' + segment + ' 段 · DeepSeek 分析',
-    '<p class="muted">' + E(report.model + ' · ' + source) + '</p><p class="diagnostic-change">' + E(report.summary) + '</p>' +
-    (choices || '<p class="muted">暂无可应用的修复，请按分析结论检查素材。</p>'),
-    button('返回检查', 'checks') + (choices ? button('应用所选修复', 'apply-diagnosis',
-      'class="primary" data-token="' + E(report.token) + '"') : ''), 'diagnosis');
+  modal('一致性检查', (issue || '<p class="green">全部通过。</p>') + missing);
 }
 function prompts() {
   const p = project(), { seg } = pick();
@@ -384,7 +278,7 @@ function prompts() {
     button('DeepSeek 优化', 'optimize') + (edits.length ? button('回退一版', 'undo') : '') + button('保存编辑', 'save-prompt', 'class="primary"'), 'prompt');
 }
 async function confirmQueue(segment, part, mode = 'normal') {
-  const { blockers, ready, reviews, reused, reusedClips, settings } = await invoke('preflight', current, segment, part, mode);
+  const { blockers, ready, reviews, reused, settings } = await invoke('preflight', current, segment, part, mode);
   const grouped = [...Map.groupBy(reviews, issue => issue.message)].map(([message, entries]) =>
     '<details><summary>' + E(message) + ' · ' + entries.length + ' 处</summary>' + entries.map(issue =>
       button('第 ' + issue.segment + ' 段' + (issue.shot ? ' / ' + issue.shot + ' 镜' : ''), 'locate',
@@ -395,15 +289,11 @@ async function confirmQueue(segment, part, mode = 'normal') {
   const body = '<div class="confirm-list"><h3>必须处理 · ' + blockers.length + '</h3>' +
     (blockers.length ? '<ul class="red">' + blockers.map(item => '<li>' + E(item) + '</li>').join('') + '</ul>' : '<p class="green">无阻塞项</p>') +
     '<details><summary>建议复核 · ' + reviews.length + ' 处</summary>' + (grouped || '<p>无</p>') + '</details>' +
-    (reusedClips.length ? '<details open><summary>已有可用片段 · ' + reusedClips.length + ' 个</summary><ul>' +
-      reusedClips.map(clip => '<li' + (clip.hd ? ' class="green"' : '') + '>子段 ' + E(clip.id) + ' · ' +
-        E(clip.hd ? '采用高清 ' + clip.hd.width + ' × ' + clip.hd.height : '采用原版 ' + (clip.resolution || '')) + '</li>').join('') +
-      '</ul></details>' : '') +
     '<h3>可提交 · ' + ready.length + ' 个子段</h3><p>' + ready.reduce((sum, item) => sum + item.duration, 0) + ' 秒 · ' +
     E(settings.model || '') + ' · ' + E(settings.resolution) + ' · ' + E(settings.ratio) + ' · 已有可用片段 ' + reused + ' 个</p>' + references +
     (ready.length ? '<p>按 MiniMax 账户资费扣费，部分参考图也可能计费。</p>' : '') +
     (mode === 'redo' ? '<p>生成后可对比版本，再选入整集。</p>' : '') +
-    (mode === 'sample' ? '<p>480P 小样由 MiniMax 云端生成，完成后下载到本机单独预览。</p>' : '') + '</div>';
+    (mode === 'sample' ? '<p>小样单独预览，正式子段仍可按设定分辨率生成。</p>' : '') + '</div>';
   const attrs = 'data-part="' + E(part || '') + '" data-segment="' + (segment || '') + '"';
   const title = part ? (mode === 'sample' ? '480P 小样 · ' : mode === 'redo' ? '重做子段 · ' : '检查并生成子段 · ') + part :
     segment ? '检查第 ' + segment + ' 段' : '整集生成前检查';
@@ -421,34 +311,6 @@ function shotEditor() {
     '<p class="muted">画布原台词与时长保持原样。改动会用于之后提交的生成任务与本地混音。</p>',
     (shot.originalFields ? button('恢复导入内容', 'shot-reset') : '') + button('保存分镜', 'shot-save', 'class="primary"'));
 }
-function bindingEditor() {
-  const p = project(), { seg } = pick();
-  const allAssets = [...p.scenes, ...p.assets];
-  const groups = [['characters', '人物', p.characters], ['scenes', '场景', allAssets.filter(item => item.kind === '场景')],
-    ['props', '道具', allAssets.filter(item => item.kind !== '场景')]];
-  const body = groups.map(([key, label, items]) => '<fieldset class="binding-choices"><legend>' + label + '</legend>' +
-    (items.map(item => '<label><input type="checkbox" data-binding="' + key + '" value="' + E(item.id) + '"' +
-      ((key === 'characters' ? seg.bindings.characters : seg.bindings.assets).some(bound => bound.id === item.id) ? ' checked' : '') + '>' + (p.images[item.image] ?
-        '<img alt="" src="' + url('image', p.id, item.image) + '">' : '') +
-      '<span>' + E(item.name) + (p.images[item.image] ? '' : ' · 缺参考图') + '</span></label>').join('') ||
-      '<p class="muted">项目库暂无此类资源。</p>') + '</fieldset>').join('');
-  modal('编辑第 ' + seg.index + ' 段的绑定', '<p class="muted">手动选择应用到本段各子段的后续生成。已有任务保留提交时的素材，设定图仍受每次最多 9 张参考图的限制。</p>' + body,
-    (seg.bindingOverrides ? button('恢复自动绑定', 'binding-reset') : '') + button('保存绑定', 'binding-save', 'class="primary"'));
-}
-function artLibrary() {
-  const p = project();
-  const groups = [['人物', p.characters, 'characters'], ['场景', p.scenes, 'scenes'], ['场景与道具', p.assets, 'assets']];
-  const content = groups.map(([title, items, group]) => '<fieldset class="binding-choices art-library"><legend>' + title + '</legend>' +
-    (items.map(item => {
-      const options = 'data-group="' + group + '" data-asset="' + E(item.id) + '"';
-      const preview = p.images[item.image] ? '<img alt="" src="' + url('image', p.id, item.image) + '">' : '';
-      return '<section class="art-item">' + preview + '<strong>' + E(item.name) + '</strong>' +
-        (!preview ? '<small class="muted">缺参考图</small>' : '') + '<div>' + button('选择本地图片', 'art-replace', options) +
-        (item.originalImage !== undefined ? button('恢复原图', 'art-reset', options) : '') + '</div></section>';
-    }).join('') || '<p class="muted">暂无此类资源。</p>') + '</fieldset>').join('');
-  modal('替换美术资源', '<p class="muted">换图会更新当前项目使用该资源的各段。支持 PNG、JPEG、WebP。</p>' + content,
-    button('完成', 'close', 'class="primary"'), 'art');
-}
 function versions(part) {
   const p = project(), job = p.jobs[part];
   const entries = [...(job.versions || []), job].filter(item => item.status === 'done');
@@ -460,8 +322,7 @@ function versions(part) {
       url('clip', p.id, part + ':' + item.localId) + '"></video>' + (active ? '' : button('采用此版本', 'select-version', attrs)) + '</section>';
   }).join('');
   modal('子段 ' + part + ' · 版本对比', '<div class="version-grid">' + panels + '</div>' +
-    '<p class="muted">选择其他版本后，可重新拼接更新整集。</p>',
-    job.usable ? button('当前采用版转高清', 'hd-check', 'data-part="' + E(part) + '"') : '');
+    '<p class="muted">选择其他版本后，可重新拼接更新整集。</p>');
 }
 function reviewEpisode() {
   const p = project();
@@ -523,22 +384,12 @@ function mixSettings() {
   }
 }
 function retry(part) {
-  const jobs = project().jobs;
-  const job = jobs[part];
-  const sample = part.startsWith('sample-');
-  const formalPart = sample ? part.slice(7) : '';
-  const canUseFormal = sample && jobs[formalPart]?.usable;
+  const job = project().jobs[part];
   const uncertain = job.status === 'uncertain';
-  const { message, code, requestId } = job.error || {};
-  const title = sample ? '处理 480P 小样 · ' + formalPart : '重试子段 ' + part;
-  modal(uncertain ? '核对 MiniMax 任务' : title, '<p>' + E((message || '') + (code ? '（' + code + '）' : '')) + '</p>' +
-    (sample ? '<p class="muted">小样尚无可导出的视频。' +
-      (canUseFormal ? '这个子段已有正式版，可直接在本机转高清。' : '小样生成完成后即可转高清。') + '</p>' : '') +
-    (requestId ? '<p class="muted">MiniMax 请求 ID <span class="mono">' + E(requestId) + '</span></p>' : '') +
+  modal(uncertain ? '核对 MiniMax 任务' : '重试子段 ' + part, '<p>' + E(job.error?.message) + '</p>' +
     (uncertain ? '<p class="notice">如 MiniMax 已接收，请填写远端任务 ID。确认没有原任务后，才重新提交。</p><label class="field">已有远端任务 ID<input id="remote-id"></label>' :
-      '<p class="muted">' + (job.resumeRemote ? '继续查询 MiniMax 原任务，完成后下载到本机。' : '将重新提交给 MiniMax 云端，按服务商资费计费。') + '</p>'),
-    button('取消', 'close') + (canUseFormal ? button('正式版转高清', 'hd-check', 'data-part="' + E(formalPart) + '"') : '') +
-    (uncertain ? button('恢复已有任务', 'retry-remote', 'data-part="' + part + '"') : '') +
+      '<p class="muted">' + (job.resumeRemote ? '继续查询或下载原任务。' : '重新提交会按服务商资费计费。') + '</p>'),
+    button('取消', 'close') + (uncertain ? button('恢复已有任务', 'retry-remote', 'data-part="' + part + '"') : '') +
     button(uncertain ? '确认重新提交' : '确认重试', 'retry-now', 'class="primary" data-part="' + part + '"'));
 }
 async function importZip(file) {
@@ -577,45 +428,11 @@ async function act(action, data) {
   const p = project();
   const { seg } = pick();
   switch (action) {
-    case 'settings':
-      settings();
-      if (state.settings.deepSuffix) await refreshModelLists(['deep']);
-      break;
+    case 'settings': settings(); break;
     case 'close': close(); break;
     case 'project': current = data.id; selection = 1; render(); break;
     case 'shot': selection = Number(data.shot); render(); break;
-    case 'timeline-focus':
-      timelineFocus = !timelineFocus;
-      render();
-      $('.segment.selected')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-      break;
     case 'checks': checks(); break;
-    case 'fullscreen': await invoke('fullscreen'); break;
-    case 'diagnose': {
-      const segment = Number($('#analysis-segment').value);
-      const withImages = $('#analysis-images').checked;
-      const status = $('#modal-status');
-      status.textContent = 'DeepSeek 正在分析…';
-      const report = await invoke('diagnose', current, segment, withImages, $('#analysis-model').value);
-      if ($('#modal-status') === status) diagnosisReview(segment, report);
-      break;
-    }
-    case 'apply-diagnosis': {
-      const indices = [...dialog.querySelectorAll('[data-proposal]:checked')].map(item => Number(item.dataset.proposal));
-      const remaining = await invoke('apply-diagnosis', current, data.token, indices);
-      await refresh(); checks();
-      if ($('#modal-status')) $('#modal-status').textContent = '已应用，本段剩余 ' + remaining + ' 项。';
-      else notify('已应用，本段剩余 ' + remaining + ' 项。');
-      break;
-    }
-    case 'art-library': artLibrary(); break;
-    case 'art-replace':
-    case 'art-reset':
-      if (await invoke('replace-art', current, data.group, data.asset, action === 'art-reset')) {
-        await refresh();
-        if (openModal === 'art') artLibrary();
-      }
-      break;
     case 'locate':
       selection = Number(data.shot) || p.segments.find(item => item.index === Number(data.segment)).shots[0].shotIndex;
       close(); render();
@@ -637,11 +454,7 @@ async function act(action, data) {
       await confirmQueue(segment.index, data.part, action === 'sample-check' ? 'sample' : 'normal');
       break;
     }
-    case 'sample-now':
-      $('#modal-status').textContent = '正在加入队列…';
-      await invoke('sample', current, Number(data.segment), data.part);
-      close(); await refresh(); notify('480P 小样已加入队列。');
-      break;
+    case 'sample-now': await invoke('sample', current, Number(data.segment), data.part); close(); await refresh(); break;
     case 'redo-check': await confirmQueue(p.jobs[data.part].segment, data.part, 'redo'); break;
     case 'redo-now': await invoke('redo', current, data.part); close(); await refresh(); break;
     case 'versions': versions(data.part); break;
@@ -660,19 +473,6 @@ async function act(action, data) {
     }
     case 'prompt': prompts(); break;
     case 'shot-edit': shotEditor(); break;
-    case 'binding-edit': bindingEditor(); break;
-    case 'binding-reset':
-    case 'binding-save': {
-      const changes = {};
-      for (const group of ['characters', 'scenes', 'props']) {
-        const options = [...dialog.querySelectorAll('[data-binding="' + group + '"]')];
-        if (options.some(option => option.checked !== option.defaultChecked)) {
-          changes[group] = options.filter(option => option.checked).map(option => option.value);
-        }
-      }
-      await invoke('edit-bindings', current, seg.index, action === 'binding-reset' ? null : changes);
-      close(); await refresh(); notify('分段绑定已更新。'); break;
-    }
     case 'shot-reset':
     case 'shot-save': {
       const { shot } = pick();
@@ -681,15 +481,17 @@ async function act(action, data) {
       close(); await refresh(); notify('分镜已更新。'); break;
     }
     case 'save-settings': {
-      const newDeepKey = Boolean($('#deep').value.trim());
       await saveSettings();
-      if (newDeepKey) await refreshModelLists(['deep']);
-      else { close(); await refresh(); notify('设置已保存。'); }
+      const notes = await refreshModelLists();
+      close();
+      notify('设置已保存。' + (notes.length ? '模型列表：' + notes.join('；') : ''));
       break;
     }
     case 'refresh-models': {
-      await saveSettings();
-      await refreshModelLists();
+      const notes = await refreshModelLists();
+      await refresh();
+      if (openModal === 'settings') settings();
+      if ($('#modal-status')) $('#modal-status').textContent = notes.join('；') || '请先填写 Key。';
       break;
     }
     case 'key-link': await invoke('key-link', data.kind); break;
@@ -706,73 +508,26 @@ async function act(action, data) {
     case 'retry-remote': {
       const remote = action === 'retry-remote' ? $('#remote-id').value.trim() : '';
       if (action === 'retry-remote' && !remote) throw Error('请输入 MiniMax 任务 ID。');
-      $('#modal-status').textContent = '正在恢复任务…';
-      await invoke('retry', current, data.part, remote);
-      close(); await refresh(); notify('任务已恢复，可在生成队列查看进度。');
-      break;
+      await invoke('retry', current, data.part, remote); close(); await refresh(); break;
     }
     case 'clip':
-    case 'clip-original': {
-      const sample = data.part.startsWith('sample-');
-      const attrs = 'data-part="' + E(data.part) + '"';
-      const hd = p.jobs[data.part]?.activeHD;
-      const original = action === 'clip-original';
-      const item = data.part + (original ? ':original' : '');
-      modal((sample ? '小样 ' + data.part.slice(7) : '子段 ' + data.part) +
-        (hd ? original ? ' · 原版' : ' · 高清 ' + hd.width + ' × ' + hd.height : ''),
-        '<video class="modal-video" controls preload="metadata" src="' + url('clip', current, item) + '"></video>',
-        (hd ? button(original ? '看高清版' : '看原版', original ? 'clip' : 'clip-original', attrs) : '') +
-        button(hd ? '重新转高清' : sample ? '小样转高清' : '本地转高清', 'hd-check', attrs) +
-        button('保存' + (hd && !original ? '高清' : '') + ' MP4', 'save-clip', 'class="primary" data-part="' + E(item) + '"'));
+      modal('子段 ' + data.part, '<video class="modal-video" controls preload="metadata" src="' + url('clip', current, data.part) + '"></video>',
+        button('保存子段 MP4', 'save-clip', 'class="primary" data-part="' + data.part + '"'));
       break;
-    }
-    case 'hd-check': {
-      const sample = data.part?.startsWith('sample-');
-      const source = sample ? '小样' : data.part ? '正式版' : '整集成片';
-      const part = sample ? data.part.slice(7) : data.part;
-      const attrs = part ? ' data-part="' + E(data.part) + '"' : '';
-      const redo = Boolean(part && p.jobs[data.part]?.activeHD);
-      modal(part ? source + (redo ? '重新转高清 · ' : '转高清 · ') + part : '本地转高清',
-        '<p>SeedVR2 3B 在本机使用显卡增强连续帧，8GB 显存模式可能较慢。FFmpeg 常规放大更快。</p>' +
-        '<p class="muted">两种方式均保留画幅与原音轨。' +
-        (part ? '点击后直接从原版处理。成功后自动采用新高清版，可在预览窗口另存。' : '结果另存为 MP4。') +
-        '</p><p id="hd-stage" role="status"></p>',
-        (part ? button('采用已有高清 MP4', 'adopt-hd', attrs) : '') +
-        button(redo ? '用 FFmpeg 重转' : 'FFmpeg 常规放大', 'save-hd', attrs) +
-        button(redo ? '用 SeedVR2 3B 重转' : 'SeedVR2 3B · AI 转高清', 'save-hd', 'class="primary" data-method="seedvr2"' + attrs));
+    case 'hd-check':
+      modal('本地转高清', '<p>使用本机 FFmpeg 放大成片，保持比例并保留原音轨和字幕画面。竖屏 9:16 输出 1080 × 1920。放大不会恢复原视频缺失的细节。</p>',
+        button('选择保存位置', 'save-hd', 'class="primary"'));
       break;
-    }
     case 'save-hd': {
-      const status = $('#hd-stage');
-      status.className = 'green';
-      status.textContent = data.part ? '已启动本地处理，正在读取原版视频…' : '选择保存位置后将在本机处理…';
-      const controls = [...dialog.querySelectorAll('[data-action="save-hd"], [data-action="adopt-hd"]')];
-      controls.forEach(control => { control.disabled = true; });
-      const off = window.studio.onHdProgress ? window.studio.onHdProgress(progress => {
-        if (dialog.open && $('#hd-stage') === status) status.textContent = typeof progress === 'number' ?
-          '本地转高清处理中 ' + progress + '%…' : progress.stage;
+      $('#modal-status').textContent = '选择保存位置后将在本机处理…';
+      const off = window.studio.onHdProgress ? window.studio.onHdProgress(pct => {
+        if (dialog.open && $('#modal-status')) $('#modal-status').textContent = '本地转高清处理中 ' + pct + '%…';
       }) : null;
       try {
-        const method = data.method || 'ffmpeg';
-        const hd = data.part ? await invoke('enhance-clip', current, data.part, method) :
-          await invoke('export', 'hd', current, undefined, method);
-        if (hd) {
-          if (dialog.open && $('#hd-stage') === status) close();
-          await refresh();
-          notify((hd.adopted ? '已采用新高清版 · ' : '已保存高清 MP4 · ') + hd.width + ' × ' + hd.height);
-        } else if (dialog.open && $('#hd-stage') === status) status.textContent = '';
-      } catch (error) {
-        if (!dialog.open || $('#hd-stage') !== status) notify(error.message, true);
-        else { status.className = 'red'; status.textContent = error.message; }
-      } finally {
-        if (off) off();
-        controls.forEach(control => { control.disabled = false; });
-      }
-      break;
-    }
-    case 'adopt-hd': {
-      const result = await invoke('adopt-hd', current, data.part);
-      if (result) { close(); await refresh(); notify('已采用高清 · ' + result.width + ' × ' + result.height); }
+        const hd = await invoke('export', 'hd', current);
+        if (hd) { close(); notify('已保存高清 MP4 · ' + hd.width + ' × ' + hd.height); }
+        else if (dialog.open && $('#modal-status')) $('#modal-status').textContent = '';
+      } finally { if (off) off(); }
       break;
     }
     case 'save-clip':

@@ -61,6 +61,17 @@ function normalize(raw) {
           startSec: shot.startSec ?? null, endSec: shot.endSec ?? null,
           framing: text(shot.framing), camera: text(shot.camera), visual: text(shot.visual), sfx: text(shot.sfx),
           prompt: text(shot.prompt || shot.videoPrompt), charIds: list(shot.charIds).map(String),
+          director: shot.director && typeof shot.director === 'object' ? {
+            event: text(shot.director.event), viewpoint: text(shot.director.viewpoint), focus: text(shot.director.focus),
+            eyeline: text(shot.director.eyeline), pressure: text(shot.director.pressure) } : null,
+          ledger: shot.ledger && typeof shot.ledger === 'object' ? {
+            function: text(shot.ledger.function), before: text(shot.ledger.before), after: text(shot.ledger.after),
+            dependsOn: list(shot.ledger.dependsOn).map(Number).filter(n => Number.isFinite(n)) } : null,
+          state: text(shot.state),
+          acceptance: shot.acceptance && typeof shot.acceptance === 'object' ? {
+            status: ['pass', 'fail', 'unknown'].includes(shot.acceptance.status) ? shot.acceptance.status : 'unknown',
+            failed: list(shot.acceptance.failed).map(String), evidence: text(shot.acceptance.evidence),
+            retries: Number.isFinite(Number(shot.acceptance.retries)) ? Number(shot.acceptance.retries) : 0 } : null,
           assetIds: list(shot.assetIds).map(String), hasDialogue: shot.hasDialogue === true || shot.dialogue != null,
           dialogue: typeof shot.dialogue?.text === 'string' ?
             { speaker: text(shot.dialogue.speaker), text: shot.dialogue.text } : null,
@@ -86,7 +97,7 @@ function normalize(raw) {
   };
 }
 
-function bindings(project, shots, overrides) {
+function bindings(project, shots) {
   const words = shots.flatMap(shot => [shot.visual, shot.prompt, shot.dialogue?.speaker, shot.dialogue?.text]).join('\n');
   const storedCharIds = [...new Set(shots.flatMap(shot => list(shot.charIds)).map(String))];
   const storedAssetIds = [...new Set(shots.flatMap(shot => list(shot.assetIds)).map(String))];
@@ -103,22 +114,13 @@ function bindings(project, shots, overrides) {
   // 名字匹配只作补充。以前只靠名字匹配，段 1–4 的卡片、空气墙全丢了。
   const assetPool = [...project.scenes, ...project.assets];
   const assets = [...new Map([...byId(assetPool, storedAssetIds), ...named(assetPool)].map(item => [item.id, item])).values()];
-  if (!overrides) return { characters, assets };
-  const scenes = assetPool.filter(item => item.kind === '场景');
-  const props = assetPool.filter(item => item.kind !== '场景');
-  return {
-    characters: overrides.characters ? byId(project.characters, overrides.characters) : characters,
-    assets: [
-      ...(overrides.scenes ? byId(scenes, overrides.scenes) : assets.filter(item => item.kind === '场景')),
-      ...(overrides.props ? byId(props, overrides.props) : assets.filter(item => item.kind !== '场景')),
-    ],
-  };
+  return { characters, assets };
 }
 
 // MiniMax 每请求最多 9 张参考图：按四宫格图、人物、场景、道具排优先级取前 9 张，
 // 超出的只在一致性检查里报提醒，不拦生成。
 function referenceFiles(project, segment, part) {
-  const { characters, assets } = bindings(project, part.shots, segment.bindingOverrides);
+  const { characters, assets } = bindings(project, part.shots);
   const scenes = assets.filter(item => item.kind === '场景');
   const props = assets.filter(item => item.kind !== '场景');
   const ordered = [...new Set([segment.gridImage, ...characters.map(item => item.image),
@@ -145,7 +147,7 @@ function plan(segment) {
 }
 
 function prompt(project, segment, part, edits = {}) {
-  const { characters, assets } = bindings(project, part.shots, segment.bindingOverrides);
+  const { characters, assets } = bindings(project, part.shots);
   const inactive = project.characters.filter(item => !characters.includes(item));
   const filterPeople = value => value.replace(/([^；;\n]*[；;\n]?)/g, chunk => {
     if (!inactive.some(item => chunk.includes(item.name))) return chunk;
@@ -172,18 +174,22 @@ function prompt(project, segment, part, edits = {}) {
       ? filterPeople(edits[shot.shotIndex]) : [shot.camera, shot.visual, shot.prompt].filter(Boolean).join('；');
     const dialogue = shot.dialogue?.text?.trim()
       ? '台词「' + (shot.dialogue.speaker ? shot.dialogue.speaker + '：' : '') + shot.dialogue.text + '」' : '无台词（静默）';
+    const directorParts = shot.director ? [shot.director.event,
+      shot.director.focus && ('信息落点：' + shot.director.focus),
+      shot.director.viewpoint && ('视角：' + shot.director.viewpoint),
+      shot.director.eyeline && ('视线：' + shot.director.eyeline),
+      shot.director.pressure && ('关系压力：' + shot.director.pressure)].filter(Boolean) : [];
+    const director = directorParts.length ? '；导演：' + directorParts.join('；') : '';
+    const state = shot.state ? '；本镜状态：' + shot.state : '';
     return '分镜' + shot.shotIndex + ' ' + span + ' [' + shot.framing + '] ' + dynamics + '；' + dialogue
-      + (shot.sfx ? '；音效：' + shot.sfx : '');
+      + (shot.sfx ? '；音效：' + shot.sfx : '') + director + state;
   });
   return [filterSetup(project.globalSetup), filterSetup(segment.setup), filterPeople(segment.voices),
-    segment.bindingOverrides?.characters && characters.length ? '人物参考：' + characters.map(item => item.name).join('、') : '',
     assets.length ? '资产锁：' + assets.map(item => [item.name, item.description, item.style].filter(Boolean).join('｜')).join('；') : '',
     grid, '第' + segment.index + '段／共' + project.segments.length + '段'
       + (part.count > 1 ? '（第' + (part.index + 1) + '部分／共' + part.count + '部分）' : '') + '，时长约' + part.seconds + '秒',
     ...lines, '台词严格照原文逐字说，禁止增删、合并或改写。无台词的镜保持静默。', restrictAssets(filterPeople(segment.endCard))].filter(Boolean).join('\n');
 }
-
-const shotEvidence = segment => JSON.stringify(segment.shots.map(shot => [shot.visual, shot.prompt, shot.dialogue]));
 
 function inspect(project) {
   const issues = [];
@@ -200,8 +206,7 @@ function inspect(project) {
   };
   for (const segment of project.segments) {
     check(segment.gridImage, '四宫格图', segment.index);
-    const bound = bindings(project, segment.shots, segment.bindingOverrides);
-    for (const item of Object.values(bound).flat()) check(item.image, item.name + '参考图', segment.index);
+    for (const item of Object.values(bindings(project, segment.shots)).flat()) check(item.image, item.name + '参考图', segment.index);
     try {
       plan(segment);
       for (const part of plan(segment)) {
@@ -213,6 +218,10 @@ function inspect(project) {
       if (shot.hasDialogue && !shot.dialogue?.text?.trim()) add('red', segment.index, shot.shotIndex, '标注有台词，原文为空');
       if (!shot.durationSec) add('red', segment.index, shot.shotIndex, '镜头时长为 0');
       if (!shot.sfx) add('yellow', segment.index, shot.shotIndex, '未填写音效');
+      if (shot.acceptance?.status === 'fail') {
+        add('red', segment.index, shot.shotIndex, '画布验收未通过' + (shot.acceptance.failed.length ? '：' + shot.acceptance.failed.join('、') : '')
+          + (shot.acceptance.retries ? '（已补跑 ' + shot.acceptance.retries + ' 次）' : ''));
+      }
       const known = new Set([...project.characters, ...project.scenes, ...project.assets].map(item => item.id));
       for (const id of [...shot.charIds, ...shot.assetIds]) {
         if (!known.has(String(id))) add('red', segment.index, shot.shotIndex, '绑定的资源不在库中：' + id);
@@ -221,8 +230,7 @@ function inspect(project) {
         add('red', segment.index, shot.shotIndex, '画面描述含场标题残留，请回画布重拆分镜后重新导出');
       }
     }
-    if (!bound.characters.length && !segment.shots.some(shot => shot.dialogue?.text?.trim()) &&
-        (!segment.emptyCast || segment.emptyCast !== shotEvidence(segment))) {
+    if (!bindings(project, segment.shots).characters.length && !segment.shots.some(shot => shot.dialogue?.text?.trim())) {
       add('yellow', segment.index, null, '本段无人物绑定');
     }
   }
@@ -337,5 +345,5 @@ function readStoryboard(csv) {
   return scenes;
 }
 
-module.exports = { bindings, imageType, inspect, normalize, plan, prompt, readProjectZip, readStoryboard, referenceFiles, seconds, safeImage, shotEvidence };
+module.exports = { bindings, imageType, inspect, normalize, plan, prompt, readProjectZip, readStoryboard, referenceFiles, seconds, safeImage };
 
