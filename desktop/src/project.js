@@ -86,7 +86,7 @@ function normalize(raw) {
   };
 }
 
-function bindings(project, shots) {
+function bindings(project, shots, overrides) {
   const words = shots.flatMap(shot => [shot.visual, shot.prompt, shot.dialogue?.speaker, shot.dialogue?.text]).join('\n');
   const storedCharIds = [...new Set(shots.flatMap(shot => list(shot.charIds)).map(String))];
   const storedAssetIds = [...new Set(shots.flatMap(shot => list(shot.assetIds)).map(String))];
@@ -103,13 +103,22 @@ function bindings(project, shots) {
   // 名字匹配只作补充。以前只靠名字匹配，段 1–4 的卡片、空气墙全丢了。
   const assetPool = [...project.scenes, ...project.assets];
   const assets = [...new Map([...byId(assetPool, storedAssetIds), ...named(assetPool)].map(item => [item.id, item])).values()];
-  return { characters, assets };
+  if (!overrides) return { characters, assets };
+  const scenes = assetPool.filter(item => item.kind === '场景');
+  const props = assetPool.filter(item => item.kind !== '场景');
+  return {
+    characters: overrides.characters ? byId(project.characters, overrides.characters) : characters,
+    assets: [
+      ...(overrides.scenes ? byId(scenes, overrides.scenes) : assets.filter(item => item.kind === '场景')),
+      ...(overrides.props ? byId(props, overrides.props) : assets.filter(item => item.kind !== '场景')),
+    ],
+  };
 }
 
 // MiniMax 每请求最多 9 张参考图：按四宫格图、人物、场景、道具排优先级取前 9 张，
 // 超出的只在一致性检查里报提醒，不拦生成。
 function referenceFiles(project, segment, part) {
-  const { characters, assets } = bindings(project, part.shots);
+  const { characters, assets } = bindings(project, part.shots, segment.bindingOverrides);
   const scenes = assets.filter(item => item.kind === '场景');
   const props = assets.filter(item => item.kind !== '场景');
   const ordered = [...new Set([segment.gridImage, ...characters.map(item => item.image),
@@ -136,7 +145,7 @@ function plan(segment) {
 }
 
 function prompt(project, segment, part, edits = {}) {
-  const { characters, assets } = bindings(project, part.shots);
+  const { characters, assets } = bindings(project, part.shots, segment.bindingOverrides);
   const inactive = project.characters.filter(item => !characters.includes(item));
   const filterPeople = value => value.replace(/([^；;\n]*[；;\n]?)/g, chunk => {
     if (!inactive.some(item => chunk.includes(item.name))) return chunk;
@@ -167,11 +176,14 @@ function prompt(project, segment, part, edits = {}) {
       + (shot.sfx ? '；音效：' + shot.sfx : '');
   });
   return [filterSetup(project.globalSetup), filterSetup(segment.setup), filterPeople(segment.voices),
+    segment.bindingOverrides?.characters && characters.length ? '人物参考：' + characters.map(item => item.name).join('、') : '',
     assets.length ? '资产锁：' + assets.map(item => [item.name, item.description, item.style].filter(Boolean).join('｜')).join('；') : '',
     grid, '第' + segment.index + '段／共' + project.segments.length + '段'
       + (part.count > 1 ? '（第' + (part.index + 1) + '部分／共' + part.count + '部分）' : '') + '，时长约' + part.seconds + '秒',
     ...lines, '台词严格照原文逐字说，禁止增删、合并或改写。无台词的镜保持静默。', restrictAssets(filterPeople(segment.endCard))].filter(Boolean).join('\n');
 }
+
+const shotEvidence = segment => JSON.stringify(segment.shots.map(shot => [shot.visual, shot.prompt, shot.dialogue]));
 
 function inspect(project) {
   const issues = [];
@@ -188,7 +200,8 @@ function inspect(project) {
   };
   for (const segment of project.segments) {
     check(segment.gridImage, '四宫格图', segment.index);
-    for (const item of Object.values(bindings(project, segment.shots)).flat()) check(item.image, item.name + '参考图', segment.index);
+    const bound = bindings(project, segment.shots, segment.bindingOverrides);
+    for (const item of Object.values(bound).flat()) check(item.image, item.name + '参考图', segment.index);
     try {
       plan(segment);
       for (const part of plan(segment)) {
@@ -208,7 +221,8 @@ function inspect(project) {
         add('red', segment.index, shot.shotIndex, '画面描述含场标题残留，请回画布重拆分镜后重新导出');
       }
     }
-    if (!bindings(project, segment.shots).characters.length && !segment.shots.some(shot => shot.dialogue?.text?.trim())) {
+    if (!bound.characters.length && !segment.shots.some(shot => shot.dialogue?.text?.trim()) &&
+        (!segment.emptyCast || segment.emptyCast !== shotEvidence(segment))) {
       add('yellow', segment.index, null, '本段无人物绑定');
     }
   }
@@ -323,5 +337,5 @@ function readStoryboard(csv) {
   return scenes;
 }
 
-module.exports = { bindings, imageType, inspect, normalize, plan, prompt, readProjectZip, readStoryboard, referenceFiles, seconds, safeImage };
+module.exports = { bindings, imageType, inspect, normalize, plan, prompt, readProjectZip, readStoryboard, referenceFiles, seconds, safeImage, shotEvidence };
 

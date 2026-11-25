@@ -4,14 +4,15 @@ const files = require('node:fs/promises');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const atomic = require('write-file-atomic');
+const { imageSize } = require('image-size');
 const projectData = require('./project');
 const defaultProvider = require('./providers');
 const media = require('./render');
 
 const defaults = {
   base: 'https://api.minimax.io', resolution: '768P', ratio: '9:16', generateAudio: false,
-  concurrency: 2, transition: 'dissolve', effects: true, miniModel: 'MiniMax-H3', deepModel: 'deepseek-chat',
-  miniModels: ['MiniMax-H3', 'MiniMax-H3-Max'], deepModels: ['deepseek-chat', 'deepseek-reasoner'],
+  concurrency: 2, transition: 'dissolve', effects: true, miniModel: 'MiniMax-H3', deepModel: 'deepseek-flash',
+  deepModels: ['deepseek-flash', 'deepseek-v4-pro'],
 };
 const keyLabels = { mini: 'MiniMax', deep: 'DeepSeek' };
 const activeStates = ['submitting', 'remote'];
@@ -21,7 +22,8 @@ const selectedClip = job => job?.selectedVersion ? job.versions?.find(version =>
 const sampleJobId = partId => 'sample-' + partId;
 const compactError = error => {
   if (error.code === 'ENOSPC') return { message: '磁盘空间不足，请释放空间后重试。', code: 'ENOSPC' };
-  return { message: error.message || '操作失败，请检查网络或本地文件。', code: error.code ?? error.status ?? '' };
+  return { message: error.message || '操作失败，请检查网络或本地文件。', code: error.code ?? error.status ?? '',
+    ...(error.requestId ? { requestId: error.requestId } : {}) };
 };
 class Workspace {
   constructor({ root, secureStorage, ffmpeg, provider = defaultProvider, assembler = media.assemble, pollMs = 12000 }) {
@@ -33,10 +35,12 @@ class Workspace {
     this.data = this.load(this.stateFile, { projects: [], settings: defaults, secrets: {}, hold: null });
     this.running = new Set();
     this.rendering = new Set();
+    this.diagnostics = new Map();
     this.lastQueueError = '';
     let recovered = false;
     for (const project of this.data.projects) {
       this.initialize(project);
+      if (project.images) project.check = projectData.inspect(project);
       for (const job of Object.values(project.jobs)) {
         if (job.status === 'submitting') {
           job.status = 'uncertain';
@@ -84,15 +88,29 @@ class Workspace {
     if (!key) throw Error('缺少 ' + keyLabels[kind] + ' Key，请在设置中填写。');
     return key;
   }
-  settings() { return { ...defaults, ...this.data.settings }; }
+  settings() {
+    const settings = { ...defaults, ...this.data.settings };
+    settings.miniModels = defaultProvider.miniVideoModels(settings.base);
+    if (!settings.miniModels.includes(settings.miniModel)) settings.miniModel = defaults.miniModel;
+    if (!defaultProvider.miniResolutions(settings.miniModel, settings.base).includes(settings.resolution)) settings.resolution = defaults.resolution;
+    if (!defaultProvider.miniSupportsAdaptive(settings.miniModel) && settings.ratio === 'adaptive') settings.ratio = defaults.ratio;
+    return settings;
+  }
   setSettings(input) {
     const current = this.settings();
-    const choices = { base: defaultProvider.BASES, resolution: ['768P', '2K'],
+    if (defaultProvider.BASES.includes(input.base)) current.base = input.base;
+    current.miniModels = defaultProvider.miniVideoModels(current.base);
+    const choices = {
       ratio: ['9:16', '16:9', '1:1', 'adaptive'], transition: ['dissolve', 'cut'],
       miniModel: current.miniModels || [], deepModel: current.deepModels || [] };
     for (const [field, allowed] of Object.entries(choices)) {
       if (allowed.includes(input[field])) current[field] = input[field];
     }
+    if (!current.miniModels.includes(current.miniModel)) current.miniModel = defaults.miniModel;
+    if (!defaultProvider.miniSupportsAdaptive(current.miniModel) && current.ratio === 'adaptive') current.ratio = defaults.ratio;
+    const resolutions = defaultProvider.miniResolutions(current.miniModel, current.base);
+    if (resolutions.includes(input.resolution)) current.resolution = input.resolution;
+    else if (!resolutions.includes(current.resolution)) current.resolution = defaults.resolution;
     for (const field of ['generateAudio', 'effects']) {
       if (typeof input[field] === 'boolean') current[field] = input[field];
     }
@@ -117,20 +135,25 @@ class Workspace {
   }
   async refreshModels(kind) {
     if (!Object.hasOwn(keyLabels, kind)) throw Error('未知服务商。');
+    if (kind === 'mini') {
+      const { miniModels, miniModel } = this.settings();
+      return { models: miniModels, model: miniModel };
+    }
     const key = this.requireKey(kind);
-    const listFn = kind === 'mini' ? this.provider.listMiniMaxModels : this.provider.listDeepSeekModels;
-    if (typeof listFn !== 'function') throw Error('当前版本不支持获取模型列表。');
-    const current = this.settings();
-    const list = kind === 'mini' ? await listFn(current.base, key) : await listFn(key);
+    const list = await this.provider.listDeepSeekModels(key);
     if (!list.length) throw Error('该账号下没有可用模型，请检查 Key 权限。');
-    const field = kind === 'mini' ? 'miniModels' : 'deepModels';
-    const modelField = kind === 'mini' ? 'miniModel' : 'deepModel';
+    if (this.key(kind) !== key) throw Error('Key 已改变，请重新刷新模型列表。');
     const previous = this.data;
-    const settings = { ...current, [field]: list };
-    if (!list.includes(settings[modelField])) settings[modelField] = list[0];
+    const settings = { ...this.settings(), deepModels: list };
+    if (!list.includes(settings.deepModel)) settings.deepModel = list[0];
     this.data = { ...previous, settings };
     try { this.save(); } catch (error) { this.data = previous; throw error; }
-    return { models: list, model: settings[modelField] };
+    return { models: list, model: settings.deepModel };
+  }
+  miniVideoOptions(base) {
+    return Object.fromEntries(defaultProvider.miniVideoModels(base).map(model => [model, {
+      resolutions: defaultProvider.miniResolutions(model, base), adaptive: defaultProvider.miniSupportsAdaptive(model),
+    }]));
   }
   project(id) {
     const project = this.data.projects.find(entry => entry.id === id);
@@ -144,6 +167,8 @@ class Workspace {
         mix: this.exportSettings(project),
         jobs: Object.fromEntries(Object.entries(project.jobs).map(([id, job]) => [id, {
           ...job, usable: Boolean(selectedClip(job)),
+          activeHD: this.clipHD(project, selectedClip(job)),
+          preparing: job.status === 'queued' && this.running.has(job.localId),
         }])),
         images: Object.fromEntries(Object.entries(images).map(([name, size]) => [name, size.valid])),
         music: music?.name || '',
@@ -153,16 +178,18 @@ class Workspace {
           try {
             parts = projectData.plan(segment).map(part => ({
               ...part, prompt: projectData.prompt(project, segment, part, this.editsFor(project, segment.index)),
+              refs: projectData.referenceFiles(project, segment, part).files.map(file => path.normalize(file)),
             }));
           } catch (error) { problem = error.message; }
           return { ...segment, parts, problem,
-            bindings: projectData.bindings(project, segment.shots),
-            shots: segment.shots.map(shot => ({ ...shot, bindings: projectData.bindings(project, [shot]) })),
+            bindings: projectData.bindings(project, segment.shots, segment.bindingOverrides),
+            shots: segment.shots.map(shot => ({ ...shot, bindings: projectData.bindings(project, [shot], segment.bindingOverrides) })),
           };
         }),
       })),
       settings: {
         ...this.settings(), miniSuffix: this.key('mini').slice(-4), deepSuffix: this.key('deep').slice(-4),
+        miniVideoOptions: Object.fromEntries(defaultProvider.BASES.map(base => [base, this.miniVideoOptions(base)])),
       },
       hold: this.data.hold, queueError: this.lastQueueError,
     };
@@ -227,7 +254,11 @@ class Workspace {
               await files.mkdir(dest, { recursive: true });
               const file = candidate.localId + '.mp4';
               await files.copyFile(path.join(this.downloads, previous.id, job.file), path.join(dest, file));
-              project.jobs[part.id] = { ...candidate, file, status: 'done', reused: true, hasAudio: job.hasAudio };
+              const hd = this.clipHD(previous, job);
+              const hdFile = 'hd-' + candidate.localId + '.mp4';
+              if (hd) await files.copyFile(path.join(this.downloads, previous.id, hd.file), path.join(dest, hdFile));
+              project.jobs[part.id] = { ...candidate, file, status: 'done', reused: true, hasAudio: job.hasAudio,
+                ...(hd ? { hd: { ...hd, file: hdFile } } : {}) };
             }
           } catch (error) {
             if (error.code === 'ENOSPC') throw error;
@@ -304,7 +335,7 @@ class Workspace {
     const project = this.project(id);
     const segment = this.segment(project, n);
     const existing = this.editsFor(project, n);
-    const active = projectData.bindings(project, segment.shots).characters;
+    const active = projectData.bindings(project, segment.shots, segment.bindingOverrides).characters;
     const inactive = project.characters.filter(item => !active.includes(item));
     const changes = {};
     const key = mode === 'deep' ? this.requireKey('deep') : '';
@@ -358,11 +389,222 @@ class Workspace {
       throw error;
     }
   }
+  editBindings(id, segmentIndex, input) {
+    const project = this.project(id);
+    const segment = this.segment(project, segmentIndex);
+    const assets = [...project.scenes, ...project.assets];
+    const pools = {
+      characters: project.characters,
+      scenes: assets.filter(item => item.kind === '场景'),
+      props: assets.filter(item => item.kind !== '场景'),
+    };
+    const before = segment.bindingOverrides;
+    const check = project.check;
+    const next = input === null ? undefined : { ...before };
+    if (next) {
+      for (const [key, ids] of Object.entries(input)) {
+        if (!Object.hasOwn(pools, key) || !Array.isArray(ids) ||
+            ids.some(value => typeof value !== 'string' || !pools[key].some(item => item.id === value))) {
+          throw Error('选择的资源不在该分类的项目库里。');
+        }
+        next[key] = [...new Set(ids)];
+      }
+      if (!Object.keys(input).length) return;
+    }
+    segment.bindingOverrides = next;
+    try {
+      project.check = projectData.inspect(project);
+      this.save();
+    } catch (error) {
+      segment.bindingOverrides = before;
+      project.check = check;
+      throw error;
+    }
+  }
+  asset(project, group, id) {
+    const pools = { characters: project.characters, scenes: project.scenes, assets: project.assets };
+    const item = Object.hasOwn(pools, group) && pools[group].find(entry => entry.id === id);
+    if (!item) throw Error('项目里找不到这项美术资源。');
+    return item;
+  }
+  async replaceArt(projectId, group, id, source) {
+    const project = this.project(projectId);
+    const item = this.asset(project, group, id);
+    const previous = item.image;
+    const original = item.originalImage;
+    let target = '';
+    let metadata;
+    if (source) {
+      const mime = projectData.imageType(source);
+      const size = (await files.stat(source)).size;
+      if (!mime || size > 30 * 1024 ** 2) throw Error('请选择 30 MB 以内的 PNG、JPEG 或 WebP 图片。');
+      const buffer = await files.readFile(source);
+      if (buffer.length > 30 * 1024 ** 2) throw Error('图片超过 30 MB。');
+      let info;
+      try { info = imageSize(buffer); } catch { throw Error('无法读取图片。'); }
+      const { width, height, type } = info;
+      if ('image/' + (type === 'jpg' ? 'jpeg' : type) !== mime || !width || !height) throw Error('图片内容与所选文件格式不符。');
+      if (Math.min(width, height) < 256 || Math.max(width, height) > 5760 || width / height < 0.4 || width / height > 2.5) {
+        throw Error('参考图宽高须为 256–5760 像素，宽高比须在 0.4–2.5 之间。');
+      }
+      target = 'images/local/' + randomUUID() + path.extname(source).toLowerCase();
+      metadata = { width, height, valid: true };
+      const dest = path.join(this.projectsDir, projectId, target);
+      await files.mkdir(path.dirname(dest), { recursive: true });
+      await files.writeFile(dest, buffer, { flag: 'wx' });
+    } else if (original === undefined) return;
+    const check = project.check;
+    try {
+      if (this.project(projectId) !== project || item.image !== previous) throw Error('资源已变化，请重新打开资源管理。');
+      item.originalImage = source ? original ?? previous : undefined;
+      item.image = source ? target : original;
+      if (metadata) project.images[target] = metadata;
+      project.check = projectData.inspect(project);
+      this.save();
+    } catch (error) {
+      if (item.image === target || (!source && item.image === original)) {
+        item.image = previous;
+        item.originalImage = original;
+        project.check = check;
+      }
+      if (metadata) {
+        delete project.images[target];
+        await files.rm(path.join(this.projectsDir, projectId, target), { force: true }).catch(() => {});
+      }
+      throw error;
+    }
+  }
+  diagnosticState(project, segment) {
+    return JSON.stringify([segment, project.edits[segment.index], project.characters, project.scenes, project.assets]);
+  }
+  async diagnose(id, segmentIndex, withImages, requestedModel) {
+    const key = this.requireKey('deep');
+    const settings = this.settings();
+    const model = requestedModel ?? settings.deepModel;
+    if (typeof model !== 'string' || !settings.deepModels.includes(model)) throw Error('请从可用的 DeepSeek 模型列表选择模型。');
+    if (withImages === true && !defaultProvider.deepSupportsVision(model)) throw Error('图像分析请选择支持看图的 DeepSeek Flash。');
+    const project = this.project(id);
+    const segment = this.segment(project, segmentIndex);
+    const input = this.diagnosticState(project, segment);
+    const issues = projectData.inspect(project).issues.filter(issue => issue.segment === segmentIndex);
+    if (!issues.length) throw Error('当前段没有需要分析的检查项。');
+    this.diagnostics.delete(id);
+    const cast = issues.some(issue => issue.message === '本段无人物绑定');
+    const images = [];
+    let hasGrid = false;
+    if (withImages === true) {
+      const candidates = [{ image: segment.gridImage, label: '本段四宫格，按左上、右上、左下、右下排列。', grid: true },
+        ...(cast ? project.characters.map(item => ({ image: item.image, label: '人物定妆照 ID ' + item.id + ' ' + item.name })) : [])];
+      let bytes = 0;
+      for (const item of candidates) {
+        if (images.length >= 10 || !projectData.safeImage(item.image) || !project.images[item.image]?.valid) continue;
+        const file = path.join(this.projectsDir, id, item.image);
+        const size = await files.stat(file).then(stat => stat.size).catch(() => 0);
+        if (!size || size + bytes > 12 * 1024 ** 2) continue;
+        const buffer = await files.readFile(file);
+        bytes += buffer.length;
+        hasGrid ||= item.grid === true;
+        images.push({ label: item.label, url: 'data:' + projectData.imageType(file) + ';base64,' + buffer.toString('base64') });
+      }
+    }
+    const result = await this.provider.diagnose(key, {
+      segment: segmentIndex, setup: segment.setup, hasGrid, issues,
+      characters: project.characters.map(({ id, name, description }) => ({ id, name, description })),
+      shots: segment.shots.map(({ shotIndex, visual, prompt, dialogue, sfx, framing, camera }) =>
+        ({ shotIndex, visual, prompt, dialogue, sfx, framing, camera })),
+    }, images, model);
+    if (this.project(id) !== project || input !== this.diagnosticState(project, segment)) throw Error('分镜或资源已变化，请重新分析。');
+    const proposals = this.diagnosticProposals(project, segment, issues, result);
+    const token = randomUUID();
+    this.diagnostics.set(id, { token, input, segmentIndex, proposals });
+    return { token, proposals, images: images.length, hasGrid, model,
+      summary: typeof result?.summary === 'string' ? result.summary.slice(0, 2000) : 'DeepSeek 未提供总结。' };
+  }
+  diagnosticProposals(project, segment, issues, result) {
+    if (!Array.isArray(result?.proposals)) throw Error('DeepSeek 未返回有效的修复清单。');
+    const proposals = [];
+    const has = (shot, message) => issues.some(item => item.shot === shot && item.message.startsWith(message));
+    const seen = new Set();
+    for (const item of result.proposals.slice(0, 20)) {
+      if (typeof item?.reason !== 'string' || !item.reason.trim()) continue;
+      const reason = item.reason.slice(0, 350);
+      if ((item.kind === 'cast' || item.kind === 'empty') && has(null, '本段无人物绑定') && !seen.has('cast')) {
+        const ids = Array.isArray(item.characters) ? [...new Set(item.characters)] : [];
+        if (item.kind === 'cast' && (!ids.length || ids.length > 8 || ids.some(id => !project.characters.some(entry => entry.id === id)))) continue;
+        const names = project.characters.filter(entry => ids.includes(entry.id)).map(entry => entry.name);
+        proposals.push({ kind: item.kind, reason, characters: ids,
+          after: item.kind === 'empty' ? '确认本段为无人物镜头' : names.join('、') });
+        seen.add('cast');
+      }
+      if (item.kind !== 'shot' || seen.has(item.shot)) continue;
+      const shot = segment.shots.find(entry => entry.shotIndex === item.shot);
+      if (!shot) continue;
+      const polluted = has(item.shot, '画面描述含场标题');
+      const noSound = has(item.shot, '未填写音效');
+      const changes = [];
+      for (const [field, label] of [['visual', '画面描述'], ['prompt', '分镜提示词'], ['sfx', '拟音提示']]) {
+        if (field === 'sfx' ? !noSound : !polluted) continue;
+        const value = item[field];
+        if (typeof value !== 'string' || !value.trim() || value.length > 4000 || /##\s|^#+\s/m.test(value) || value === shot[field]) continue;
+        changes.push({ field, label, before: shot[field], after: value });
+      }
+      if (changes.length) {
+        proposals.push({ kind: 'shot', reason, shot: item.shot, changes });
+        seen.add(item.shot);
+      }
+    }
+    return proposals;
+  }
+  applyDiagnosis(id, token, indices) {
+    const project = this.project(id);
+    const draft = this.diagnostics.get(id);
+    if (!draft || draft.token !== token) throw Error('分析结果已失效，请重新分析。');
+    const segment = this.segment(project, draft.segmentIndex);
+    if (this.rendering.has(id) || this.diagnosticState(project, segment) !== draft.input) throw Error('项目正在拼接或已变化，请重新分析。');
+    if (!Array.isArray(indices) || !indices.length || indices.some(index => !Number.isInteger(index) || !draft.proposals[index])) {
+      throw Error('请选择要应用的修复。');
+    }
+    const before = structuredClone(segment);
+    const old = { check: project.check, dirty: project.dirty, edits: project.edits[segment.index] };
+    const lines = { ...this.editsFor(project, segment.index) };
+    let cleared = false;
+    let confirmEmpty = false;
+    for (const index of new Set(indices)) {
+      const item = draft.proposals[index];
+      if (item.kind === 'cast') segment.bindingOverrides = { ...segment.bindingOverrides, characters: item.characters };
+      if (item.kind === 'empty') confirmEmpty = true;
+      if (item.kind === 'shot') {
+        const shot = segment.shots.find(entry => entry.shotIndex === item.shot);
+        shot.originalFields ||= Object.fromEntries(['framing', 'visual', 'prompt', 'camera', 'sfx'].map(field => [field, shot[field]]));
+        for (const change of item.changes) {
+          shot[change.field] = change.after;
+          if (change.field === 'sfx') project.dirty = true;
+          else if (Object.hasOwn(lines, item.shot)) { delete lines[item.shot]; cleared = true; }
+        }
+      }
+    }
+    if (confirmEmpty) segment.emptyCast = projectData.shotEvidence(segment);
+    if (cleared) project.edits[segment.index] = [...old.edits, { mode: 'manual', lines, at: Date.now() }];
+    try {
+      project.check = projectData.inspect(project);
+      this.save();
+    } catch (error) {
+      project.segments[project.segments.indexOf(segment)] = before;
+      project.check = old.check;
+      project.dirty = old.dirty;
+      project.edits[segment.index] = old.edits;
+      throw error;
+    }
+    this.diagnostics.delete(id);
+    return project.check.issues.filter(issue => issue.segment === segment.index).length;
+  }
   refs(project, segment, part) {
     const { files } = projectData.referenceFiles(project, segment, part);
     if (!segment.gridImage || files.some(file => !projectData.safeImage(file) || !project.images[file]?.valid)) {
       throw Error('第 ' + segment.index + ' 段缺少可读参考图，请查看一致性检查。');
     }
+    if (segment.bindingOverrides && Object.values(projectData.bindings(project, part.shots, segment.bindingOverrides)).flat()
+      .some(item => !item.image)) throw Error('第 ' + segment.index + ' 段选中的资源没有参考图。');
     return files.map(file => path.join(this.projectsDir, project.id, file));
   }
   plans(project, n) {
@@ -378,6 +620,7 @@ class Workspace {
     };
   }
   validateSubmission(project, job) {
+    defaultProvider.validateMiniVideoOptions(job.settings, job.duration);
     if ([...job.prompt].length > 7000) throw Error('提示词超过 7000 字符。');
     let bytes = Buffer.byteLength(JSON.stringify(job.prompt)) + 2048;
     for (const ref of job.refs) {
@@ -397,6 +640,7 @@ class Workspace {
     if (this.data.hold) blockers.push(this.data.hold);
     if (this.rendering.has(id)) blockers.push('整集正在拼接。');
     let reused = 0;
+    const reusedClips = [];
     let matched = false;
     for (const segment of n ? [this.segment(project, n)] : project.segments) {
       let parts;
@@ -407,7 +651,11 @@ class Workspace {
         matched = true;
         const old = project.jobs[mode === 'sample' ? sampleJobId(part.id) : part.id];
         if (old && mode === 'normal') {
-          if (selectedClip(old)) reused++;
+          if (selectedClip(old)) {
+            reused++;
+            const clip = selectedClip(old);
+            reusedClips.push({ id: part.id, hd: this.clipHD(project, clip), resolution: clip.settings?.resolution });
+          }
           else if (['failed', 'uncertain'].includes(old.status)) blockers.push('子段 ' + part.id + ' 请在队列处理。');
           continue;
         }
@@ -426,7 +674,7 @@ class Workspace {
       }
     }
     if (partId && !matched) blockers.push('找不到所选子段。');
-    return { blockers, ready, reviews, reused, settings: submissionSettings(settings) };
+    return { blockers, ready, reviews, reused, reusedClips, settings: submissionSettings(settings) };
   }
   queueSample(id, segmentIndex, partId) {
     this.requireKey('mini');
@@ -475,6 +723,50 @@ class Workspace {
     project.dirty = true;
     try { this.save(); } catch (error) { job.selectedVersion = previous; project.dirty = dirty; throw error; }
   }
+  clipHD(project, clip) {
+    const hd = clip?.hd;
+    return hd && fs.existsSync(path.join(this.downloads, project.id, hd.file)) ? hd : null;
+  }
+  async adoptHD(id, partId, source, method, sourceVersion) {
+    const project = this.project(id);
+    const clip = selectedClip(project.jobs[partId]);
+    if (clip?.status !== 'done' || !clip.file || clip.localId !== sourceVersion || this.rendering.has(id)) {
+      throw Error('当前采用的片段已改变或整集正在拼接。');
+    }
+    const folder = path.join(this.downloads, id);
+    const original = await media.probe(this.ffmpeg, path.join(folder, clip.file), folder);
+    const meta = await media.probe(this.ffmpeg, source, folder);
+    if (!original.width || !original.height || !original.duration ||
+        meta.width <= original.width || meta.height <= original.height || !meta.duration ||
+        meta.audio !== original.audio || Math.abs(meta.duration - original.duration) > 0.25 ||
+        Math.abs((meta.width / meta.height) / (original.width / original.height) - 1) > 0.02) {
+      throw Error('请选择与原子段画幅、时长和音轨一致的高清 MP4。');
+    }
+    const file = 'hd-' + randomUUID() + '.mp4';
+    const dest = path.join(folder, file);
+    let previous;
+    try {
+      await files.copyFile(source, dest);
+      if (this.project(id) !== project || this.rendering.has(id) || selectedClip(project.jobs[partId]) !== clip) {
+        throw Error('当前采用的片段已改变或整集正在拼接。');
+      }
+      previous = clip.hd;
+      const dirty = project.dirty;
+      clip.hd = { file, width: meta.width, height: meta.height, method };
+      if (!partId.startsWith('sample-')) project.dirty = true;
+      try { this.save(); } catch (error) { clip.hd = previous; project.dirty = dirty; throw error; }
+    } catch (error) {
+      await files.rm(dest, { force: true }).catch(() => {});
+      throw error;
+    }
+    if (previous) await files.rm(path.join(folder, previous.file), { force: true }).catch(() => {});
+    return { ...meta, adopted: true };
+  }
+  clipSource(id, partId) {
+    const clip = selectedClip(this.project(id).jobs[partId]);
+    if (clip?.status !== 'done' || !clip.file) throw Error('请选择已完成的视频。');
+    return { version: clip.localId, file: path.join(this.downloads, id, clip.file) };
+  }
   queue(id, n, partId) {
     this.requireKey('mini');
     if (this.data.hold) throw Error('队列已暂停，请在设置检查 Key 后点「恢复队列」。');
@@ -509,6 +801,7 @@ class Workspace {
       job.settings = { ...job.settings, base: this.settings().base };
     }
     job.status = job.remoteId ? 'remote' : 'queued';
+    job.remoteState = null;
     job.error = null;
     job.nextAt = 0;
     job.networkFailures = 0;
@@ -543,6 +836,7 @@ class Workspace {
       this.save();
       job.remoteId = await this.provider.create(job.settings, key, body);
       job.status = 'remote';
+      job.remoteState = null;
       job.nextAt = Date.now() + this.pollMs;
       this.save();
       return;
@@ -550,9 +844,11 @@ class Workspace {
     const result = await this.provider.query(job.settings.base, key, job.remoteId);
     job.networkFailures = 0;
     if (['queued', 'running', 'processing', 'pending'].includes(result.state)) {
+      job.remoteState = result.state;
       job.nextAt = Date.now() + this.pollMs;
       job.error = null;
     } else if (['succeeded', 'success', 'completed'].includes(result.state)) {
+      job.remoteState = 'downloading';
       const folder = path.join(this.downloads, project.id);
       await files.mkdir(folder, { recursive: true });
       const name = /^[a-zA-Z0-9_-]{1,100}$/.test(job.remoteId) ? job.remoteId : job.localId;
@@ -643,10 +939,11 @@ class Workspace {
     this.save();
     const folder = path.join(this.downloads, project.id);
     const output = path.join(folder, 'episode-' + randomUUID() + '.mp4');
-    const clips = plans.map(({ part }) => ({
-      ...part, job: selectedClip(project.jobs[part.id]),
-      file: path.join(folder, selectedClip(project.jobs[part.id]).file),
-    }));
+    const clips = plans.map(({ part }) => {
+      const job = selectedClip(project.jobs[part.id]);
+      const hd = this.clipHD(project, job);
+      return { ...part, job, hd, file: path.join(folder, hd?.file || job.file) };
+    });
     for (const clip of clips) {
       try { await files.access(clip.file); }
       catch {
@@ -705,8 +1002,10 @@ class Workspace {
     if (type === 'clip') {
       const [part, version] = item.split(':');
       const job = project.jobs[part];
-      const clip = !version ? selectedClip(job) : job?.localId === version ? job : job?.versions?.find(entry => entry.localId === version);
-      if (clip?.status === 'done' && clip.file) return path.join(this.downloads, id, clip.file);
+      const clip = !version || version === 'original' ? selectedClip(job) :
+        job?.localId === version ? job : job?.versions?.find(entry => entry.localId === version);
+      if (clip?.status === 'done' && clip.file) return path.join(this.downloads, id,
+        (version ? null : this.clipHD(project, clip)?.file) || clip.file);
     }
     throw Error('素材不存在。');
   }

@@ -5,7 +5,8 @@ const { createReadStream } = require('node:fs');
 const { Readable } = require('node:stream');
 const path = require('node:path');
 const { Workspace } = require('./workspace');
-const { upscaleEpisode } = require('./render');
+const { upscaleVideo } = require('./render');
+const { seedRuntime, upscaleSeedVR2 } = require('./seedvr2');
 const { imageType } = require('./project');
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'studio', privileges: {
@@ -15,6 +16,17 @@ app.setName('短剧成片工作室');
 
 let window;
 let workspace;
+let hdExporting = false;
+async function runHD(method, file, output) {
+  const sendProgress = progress => {
+    if (window && !window.isDestroyed()) window.webContents.send('hd-progress', progress);
+  };
+  if (method === 'seedvr2') {
+    const runtime = await seedRuntime(path.join(process.env.LOCALAPPDATA || app.getPath('appData'), 'DuanjuStudio', 'SeedVR2'));
+    return upscaleSeedVR2(workspace.ffmpeg, runtime, file, output, sendProgress);
+  }
+  return upscaleVideo(workspace.ffmpeg, file, output, pct => sendProgress(Math.round(pct * 100)));
+}
 const keyLinks = { mini: 'https://platform.minimax.io', deep: 'https://platform.deepseek.com' };
 function windowOpen() {
   window = new BrowserWindow({
@@ -23,6 +35,12 @@ function windowOpen() {
     webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  window.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && input.key === 'F11' && !input.isAutoRepeat) {
+      event.preventDefault();
+      window.setFullScreen(!window.isFullScreen());
+    }
+  });
   window.webContents.on('will-navigate', event => event.preventDefault());
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   void window.loadFile(path.join(__dirname, '..', 'ui', 'index.html'));
@@ -65,7 +83,7 @@ function handle(name, callback) {
   });
 }
 function attachHandlers() {
-  handle('state', () => workspace.snapshot());
+  handle('state', () => ({ ...workspace.snapshot(), appVersion: app.getVersion() }));
   handle('import', async (file) => {
     if (!file) {
       const choice = await dialog.showOpenDialog(window, { title: '导入画布 ZIP', properties: ['openFile'],
@@ -92,6 +110,18 @@ function attachHandlers() {
   handle('preflight', (id, segment, part, mode) => workspace.preflight(id, segment, part, mode));
   handle('sample', (id, segment, part) => workspace.queueSample(id, segment, part));
   handle('edit-shot', (id, segment, shot, input) => workspace.editShot(id, segment, shot, input));
+  handle('edit-bindings', (id, segment, input) => workspace.editBindings(id, segment, input));
+  handle('diagnose', (id, segment, withImages, model) => workspace.diagnose(id, segment, withImages, model));
+  handle('apply-diagnosis', (id, token, indices) => workspace.applyDiagnosis(id, token, indices));
+  handle('fullscreen', () => window.setFullScreen(!window.isFullScreen()));
+  handle('replace-art', async (id, group, assetId, reset) => {
+    if (reset) { await workspace.replaceArt(id, group, assetId, null); return true; }
+    const choice = await dialog.showOpenDialog(window, { title: '选择本地参考图', properties: ['openFile'],
+      filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp'] }] });
+    if (choice.canceled) return false;
+    await workspace.replaceArt(id, group, assetId, choice.filePaths[0]);
+    return true;
+  });
   handle('redo', (id, part) => workspace.redo(id, part));
   handle('select-clip', (id, part, version) => workspace.selectClip(id, part, version));
   handle('mix', (id, mix) => workspace.setMix(id, mix));
@@ -106,21 +136,53 @@ function attachHandlers() {
       filters: [{ name: '音频文件', extensions: ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg'] }] });
     if (!result.canceled) return workspace.setMusic(id, result.filePaths[0]);
   });
-  handle('export', async (type, id, item) => {
-    if (!['clip', 'episode', 'hd'].includes(type)) throw Error('只能导出视频。');
-    const file = workspace.pathFor(type === 'hd' ? 'episode' : type, id, item);
-    const title = workspace.project(id).title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 80).replace(/[. ]+$/, '') || '成片';
-    const name = title + (type === 'hd' ? '-本地高清' : type === 'clip' ? '-子段-' + item : '') + '.mp4';
-    const result = await dialog.showSaveDialog(window, { title: '保存 MP4', defaultPath: name,
+  handle('adopt-hd', async (id, part) => {
+    const { version } = workspace.clipSource(id, part);
+    const result = await dialog.showOpenDialog(window, { title: '选择这个子段已有的高清 MP4', properties: ['openFile'],
       filters: [{ name: 'MP4 视频', extensions: ['mp4'] }] });
-    if (!result.canceled) {
-      if (type === 'hd') return upscaleEpisode(workspace.ffmpeg, file, result.filePath, pct => {
-        if (window && !window.isDestroyed()) window.webContents.send('hd-progress', Math.round(pct * 100));
-      });
+    if (result.canceled) return false;
+    if (path.extname(result.filePaths[0]).toLowerCase() !== '.mp4') throw Error('请选择 MP4 文件。');
+    return workspace.adoptHD(id, part, result.filePaths[0], 'imported', version);
+  });
+  handle('enhance-clip', async (id, part, method) => {
+    if (typeof part !== 'string' || !/^(sample-)?\d+-\d+$/.test(part)) throw Error('请选择已完成的视频。');
+    if (!['seedvr2', 'ffmpeg'].includes(method)) throw Error('请选择高清处理方式。');
+    if (hdExporting) throw Error('另一个高清任务正在处理。');
+    if (workspace.rendering.has(id)) throw Error('整集正在拼接，请完成后再转高清。');
+    const source = workspace.clipSource(id, part);
+    hdExporting = true;
+    let staging;
+    try {
+      staging = await fs.mkdtemp(path.join(workspace.downloads, '.enhance-'));
+      const output = path.join(staging, 'clip.mp4');
+      await runHD(method, source.file, output);
+      return await workspace.adoptHD(id, part, output, method, source.version);
+    } finally {
+      if (staging) await fs.rm(staging, { recursive: true, force: true }).catch(() => {});
+      hdExporting = false;
+    }
+  });
+  handle('export', async (type, id, item, method) => {
+    if (!['clip', 'episode', 'hd'].includes(type)) throw Error('只能导出视频。');
+    const hd = type === 'hd';
+    const ai = hd && method === 'seedvr2';
+    const clip = type === 'clip';
+    const [part = '', variant] = typeof item === 'string' ? item.split(':') : [];
+    const sample = /^sample-\d+-\d+$/.test(part);
+    if (hd && hdExporting) throw Error('正在处理另一个高清导出，请等它完成。');
+    const file = workspace.pathFor(clip ? 'clip' : 'episode', id, item);
+    const title = workspace.project(id).title.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 80).replace(/[. ]+$/, '') || '成片';
+    const clipName = (sample ? '-小样-' + part.slice(7) : '-子段-' + part) + (variant === 'original' ? '-原版' : '');
+    const name = title + (clip ? clipName : '') + (ai ? '-SeedVR2高清' : hd ? '-本地高清' : '') + '.mp4';
+    if (hd) hdExporting = true;
+    try {
+      const result = await dialog.showSaveDialog(window, { title: hd ? '保存高清 MP4' : '保存 MP4', defaultPath: name,
+        filters: [{ name: 'MP4 视频', extensions: ['mp4'] }] });
+      if (result.canceled) return false;
+      if (hd) return await runHD(method, file, result.filePath);
       if (path.resolve(file) !== path.resolve(result.filePath)) await fs.copyFile(file, result.filePath);
       return true;
-    }
-    return false;
+    } finally { if (hd) hdExporting = false; }
   });
 }
 if (!app.requestSingleInstanceLock()) app.quit();

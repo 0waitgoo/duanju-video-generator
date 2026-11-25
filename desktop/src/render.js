@@ -118,12 +118,12 @@ function soundTrack(shots, duration) {
   }
   return samples;
 }
-function outputSize(source, ratio, resolution) {
+function outputSize(source, ratio, resolution, minimumShortSide = 0) {
   const [a, b] = ratio.split(':').map(Number);
   if (!a || !b || Math.abs(source.width / source.height - a / b) < .01) {
     return [source.width & ~1, source.height & ~1];
   }
-  const short = resolution === '2K' ? 1152 : 768;
+  const short = Math.max(minimumShortSide, resolution === '2K' ? 1152 : resolution === '480P' ? 480 : 768);
   return a < b ? [short, Math.round(short * b / a / 2) * 2] : [Math.round(short * a / b / 2) * 2, short];
 }
 
@@ -135,7 +135,10 @@ async function assemble({ ffmpeg, output, clips, settings, music, onStage = () =
     await fs.rm(work, { recursive: true, force: true });
     throw Error('子段 ' + clips[0].id + ' 没有可读取的视频流。');
   }
-  const [w, h] = outputSize(first, settings.ratio, settings.resolution);
+  const shortSide = item => Math.min(item.width, item.height);
+  const largest = clips.reduce((size, clip) => clip.hd && shortSide(clip.hd) > shortSide(size) ? clip.hd : size, first);
+  const hdShortSide = clips.reduce((size, clip) => clip.hd ? Math.max(size, shortSide(clip.hd)) : size, 0);
+  const [w, h] = outputSize(largest, settings.ratio, settings.resolution, hdShortSide);
   const fragments = [];
   const dissolve = settings.transition === 'dissolve';
   const normalize = 'scale=' + w + ':' + h + ':force_original_aspect_ratio=increase,crop=' + w + ':' + h + ',setsar=1,fps=30';
@@ -205,11 +208,11 @@ async function assemble({ ffmpeg, output, clips, settings, music, onStage = () =
     await fs.rm(work, { recursive: true, force: true }).catch(() => {});
   }
 }
-async function upscaleEpisode(ffmpeg, source, output, onProgress) {
+async function upscaleVideo(ffmpeg, source, output, onProgress) {
   const work = path.dirname(output);
   if (path.resolve(source).toLowerCase() === path.resolve(output).toLowerCase()) throw Error('请选择不同的输出文件。');
   const input = await probe(ffmpeg, source, work);
-  if (!input.width || !input.height || !input.duration) throw Error('无法读取整集视频。');
+  if (!input.width || !input.height || !input.duration) throw Error('无法读取源视频。');
   const portrait = input.height >= input.width;
   const width = portrait ? 1080 : 1920;
   const height = portrait ? 1920 : 1080;
@@ -227,5 +230,5 @@ async function upscaleEpisode(ffmpeg, source, output, onProgress) {
     return meta;
   } finally { await fs.rm(temp, { force: true }).catch(() => {}); }
 }
-module.exports = { assemble, effectFor, probe, soundTrack, subtitleFile, upscaleEpisode };
+module.exports = { assemble, effectFor, encode, probe, soundTrack, subtitleFile, upscaleVideo };
 

@@ -3,7 +3,7 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const allowed = new Set(['state','import','remove','settings','test','key-link','queue','resume',
   'retry','edit','undo','reassemble','music','export','preflight','redo','select-clip','mix','sample','edit-shot',
-  'refresh-models','cleanup-versions']);
+  'refresh-models','cleanup-versions','edit-bindings','diagnose','apply-diagnosis','replace-art','fullscreen','adopt-hd','enhance-clip']);
 contextBridge.exposeInMainWorld('studio', {
   invoke(name, ...args) {
     if (!allowed.has(name)) throw Error('未知操作。');
